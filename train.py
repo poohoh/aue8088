@@ -284,7 +284,7 @@ def train(hyp, opt, device, callbacks):
             single_cls,
             hyp=hyp,
             cache=None if noval else opt.cache,
-            rect=True,
+            rect=False,  # Disable rect for RGBT validation
             rank=-1,
             workers=workers * 2,
             pad=0.5,
@@ -355,10 +355,14 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, targets, paths, shapes, indices) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            
+            if isinstance(imgs, list):
+                imgs = [img.to(device, non_blocking=True).float() / 255 for img in imgs]    # For RGB-T input
+            else:
+                imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
             # Warmup
             if ni <= nw:
@@ -374,10 +378,16 @@ def train(hyp, opt, device, callbacks):
             # Multi-scale
             if opt.multi_scale:
                 sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs  # size
-                sf = sz / max(imgs.shape[2:])  # scale factor
-                if sf != 1:
-                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
-                    imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
+                if isinstance(imgs, list):
+                    sf = sz / max(imgs[0].shape[2:])  # scale factor for RGBT
+                    if sf != 1:
+                        ns = [math.ceil(x * sf / gs) * gs for x in imgs[0].shape[2:]]  # new shape (stretched to gs-multiple)
+                        imgs = [nn.functional.interpolate(img, size=ns, mode="bilinear", align_corners=False) for img in imgs]
+                else:
+                    sf = sz / max(imgs.shape[2:])  # scale factor
+                    if sf != 1:
+                        ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                        imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
             with torch.cuda.amp.autocast(amp):
@@ -406,9 +416,11 @@ def train(hyp, opt, device, callbacks):
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f"{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
+                # Handle RGBT case where imgs is a list
+                img_size = imgs[0].shape[-1] if isinstance(imgs, list) else imgs.shape[-1]
                 pbar.set_description(
                     ("%11s" * 2 + "%11.4g" * 5)
-                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
+                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], img_size)
                 )
                 callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
@@ -555,7 +567,7 @@ def parse_opt(known=False):
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
 
     # RGBT arguments
-    parser.add_argument("--rgbt", action="store_true", help="use RGBT (RGB + Thermal) dual modality input")
+    parser.add_argument("--rgbt", action="store_true", default=True, help="use RGBT (RGB + Thermal) dual modality input")
 
     # Logger arguments
     parser.add_argument("--entity", default=None, help="Entity")
