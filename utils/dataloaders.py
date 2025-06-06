@@ -35,6 +35,7 @@ from utils.augmentations import (
     letterbox,
     mixup,
     random_perspective,
+    cutout,
 )
 from utils.general import (
     DATASETS_DIR,
@@ -1199,87 +1200,128 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
-        if mosaic:
-            raise NotImplementedError('Please make "mosaic" augmentation work!')
+        
+        # Pre-compute random values for augmentations to ensure consistency
+        flip_ud = random.random() < hyp["flipud"] if self.augment else False
+        flip_lr = random.random() < hyp["fliplr"] if self.augment else False
 
+        # --- Stage 1: Prepare base images (in a list) and labels ---
+        if mosaic:
             # TODO: Load mosaic
             img, labels = self.load_mosaic(index)
             shapes = None
-
+            
             # TODO: MixUp augmentation
             if random.random() < hyp["mixup"]:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+            
+            # To match the output format of the 'else' block, put the single mosaic image into a list
+            imgs = [img]
+            nl = len(labels)
 
-        else:
+        else:  # Non-mosaic path
             # Load image
             # hw0s: original shapes, hw1s: resized shapes
             imgs, hw0s, hw1s = self.load_image(index)
+            processed_imgs = []
 
+            # Process each modality (thermal and visible)
             for ii, (img, (h0, w0), (h, w)) in enumerate(zip(imgs, hw0s, hw1s)):
                 # Letterbox
                 shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
                 img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-                shapes = (h0, w0), (ratio, pad)  # for COCO mAP rescaling
+                if ii == 0:
+                    shapes = (h0, w0), (ratio, pad)  # for COCO mAP rescaling
 
-                labels = self.labels[index].copy()
-                if labels.size:  # normalized xywh to pixel xyxy format
-                    labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
-                    labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                # Process labels only once (for the first modality)
+                if ii == 0:
+                    labels = self.labels[index].copy()
+                    if labels.size:  # normalized xywh to pixel xyxy format
+                        labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
+                        labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
-                if self.augment:
-                    raise NotImplementedError('Please make data augmentation work!')
+                    if self.augment:
+                        img, labels = random_perspective(
+                            img,
+                            labels,
+                            degrees=hyp["degrees"],
+                            translate=hyp["translate"],
+                            scale=hyp["scale"],
+                            shear=hyp["shear"],
+                            perspective=hyp["perspective"],
+                        )
+                        
+                        # Albumentations
+                        img, labels = self.albumentations(img, labels)
+                        
+                else:  # Apply same geometric augmentation to other modalities
+                    if self.augment:
+                        img, _ = random_perspective(
+                            img,
+                            np.array([]),  # empty labels array
+                            degrees=hyp["degrees"],
+                            translate=hyp["translate"],
+                            scale=hyp["scale"],
+                            shear=hyp["shear"],
+                            perspective=hyp["perspective"],
+                        )
+                        
+                        # Albumentations (image-only)
+                        img, _ = self.albumentations(img, np.array([]))
+                
+                processed_imgs.append(img)
+            
+            imgs = processed_imgs  # Overwrite with processed images
+            
+            # Convert labels from xyxy to xywhn format for non-mosaic path
+            nl = len(labels)
+            if nl:
+                labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=imgs[0].shape[1], h=imgs[0].shape[0], clip=True, eps=1e-3)
 
-                    img, labels = random_perspective(
-                        img,
-                        labels,
-                        degrees=hyp["degrees"],
-                        translate=hyp["translate"],
-                        scale=hyp["scale"],
-                        shear=hyp["shear"],
-                        perspective=hyp["perspective"],
-                    )
+        # --- Stage 2: Apply common augmentations to all prepared images ---
+        # This block now runs for BOTH mosaic and non-mosaic paths
+        if self.augment:
+            # HSV and Flips are applied to all images in the list
+            augmented_imgs = []
+            for img in imgs:
+                # HSV color-space augmentation
+                augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+                
+                # Flip up-down (consistent across modalities)
+                if flip_ud:
+                    img = np.flipud(img)
+                
+                # Flip left-right (consistent across modalities)
+                if flip_lr:
+                    img = np.fliplr(img)
+                
+                augmented_imgs.append(img)
+            imgs = augmented_imgs
 
-                nl = len(labels)  # number of labels
-                if nl:
-                    labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
+            # Update labels for flips (only needs to be done once)
+            if nl:
+                if flip_ud:
+                    labels[:, 2] = 1 - labels[:, 2]
+                if flip_lr:
+                    labels[:, 1] = 1 - labels[:, 1]
 
-                if self.augment:
-                    # Albumentations
-                    img, labels = self.albumentations(img, labels)
-                    nl = len(labels)  # update after albumentations
+            # Cutouts
+            # labels = cutout(imgs[0], labels, p=0.5)
+            # nl = len(labels)  # update after cutout
 
-                    # HSV color-space
-                    augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+        # --- Stage 3: Final conversion and label preparation ---
+        labels_out = torch.zeros((nl, 6))  # Changed to 6 as we drop the occlusion level
+        if nl:
+            labels_out[:, 1:] = torch.from_numpy(labels[:, :5])  # Take only first 5 columns
 
-                    # Flip up-down
-                    if random.random() < hyp["flipud"]:
-                        img = np.flipud(img)
-                        if nl:
-                            labels[:, 2] = 1 - labels[:, 2]
-
-                    # Flip left-right
-                    if random.random() < hyp["fliplr"]:
-                        img = np.fliplr(img)
-                        if nl:
-                            labels[:, 1] = 1 - labels[:, 1]
-
-                    # Cutouts
-                    # labels = cutout(img, labels, p=0.5)
-                    # nl = len(labels)  # update after cutout
-
-                labels_out = torch.zeros((nl, 7))
-                if nl:
-                    labels_out[:, 1:] = torch.from_numpy(labels)
-
-                # Convert
-                img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-                img = np.ascontiguousarray(img)
-
-                imgs[ii] = torch.from_numpy(img)
-
-        # Drop occlusion level
-        labels_out = labels_out[:, :-1]
-        return imgs, labels_out, self.im_files[index], shapes, index
+        # Convert all images to CHW, RGB tensors
+        final_imgs = []
+        for img in imgs:
+            img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+            img = np.ascontiguousarray(img)
+            final_imgs.append(torch.from_numpy(img))
+        
+        return final_imgs, labels_out, self.im_files[index], shapes, index
 
     def load_image(self, i):
         """
