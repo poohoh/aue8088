@@ -268,6 +268,7 @@ def train(hyp, opt, device, callbacks):
         prefix=colorstr("train: "),
         shuffle=True,
         seed=opt.seed,
+        rgbt_input=opt.rgbt,
     )
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
@@ -288,6 +289,7 @@ def train(hyp, opt, device, callbacks):
             workers=workers * 2,
             pad=0.5,
             prefix=colorstr("val: "),
+            rgbt_input=opt.rgbt,
         )[0]
 
         if not resume:
@@ -353,7 +355,7 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, shapes, indices) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
@@ -551,6 +553,9 @@ def parse_opt(known=False):
     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
+
+    # RGBT arguments
+    parser.add_argument("--rgbt", action="store_true", help="use RGBT (RGB + Thermal) dual modality input")
 
     # Logger arguments
     parser.add_argument("--entity", default=None, help="Entity")
