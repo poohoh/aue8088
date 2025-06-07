@@ -32,38 +32,41 @@ do
     mkdir -p $TEMP_HYP_DIR
     
     # 시작 시간을 기반으로 한 고유 식별자 생성
-    TRIAL_TIMESTAMP=$(date +%Y%m%d_%H%M%S | cut -c1-20)
+    TRIAL_TIMESTAMP=$(date +%Y%m%d_%H%M%S_$(shuf -i 1000-9999 -n 1))
     TEMP_HYP_FILE="$TEMP_HYP_DIR/hyp-random-trial-$TRIAL_TIMESTAMP.yaml"
     cp $BASE_HYP_FILE $TEMP_HYP_FILE
 
     # 6. 랜덤 값 생성 (다양한 하이퍼파라미터들)
+    # 더 나은 랜덤 시드 설정 (프로세스 ID와 현재 시간 기반)
+    RANDOM_SEED=$(($(date +%s%N | cut -b1-10) + $$ + $i))
+    RANDOM=$RANDOM_SEED
     # Learning rate parameters
-    LR0=$(LC_NUMERIC="C" printf "%.6f" $(echo "scale=6; 0.001 + ($RANDOM % 19000) / 1000000" | bc))  # 0.001 ~ 0.02
-    LRF=$(LC_NUMERIC="C" printf "%.3f" $(echo "scale=3; 0.01 + ($RANDOM % 190) / 1000" | bc))      # 0.01 ~ 0.2
+    LR0=$(python3 -c "import random; random.seed($RANDOM_SEED + 1); print(f'{random.uniform(0.001, 0.02):.6f}')")
+    LRF=$(python3 -c "import random; random.seed($RANDOM_SEED + 2); print(f'{random.uniform(0.01, 0.2):.3f}')")
     
     # Optimizer parameters
-    MOMENTUM=$(LC_NUMERIC="C" printf "%.3f" $(echo "scale=3; 0.8 + ($RANDOM % 157) / 1000" | bc))   # 0.8 ~ 0.957
-    WEIGHT_DECAY=$(LC_NUMERIC="C" printf "%.6f" $(echo "scale=6; 0.0001 + ($RANDOM % 900) / 1000000" | bc)) # 0.0001 ~ 0.001
+    MOMENTUM=$(python3 -c "import random; random.seed($RANDOM_SEED + 3); print(f'{random.uniform(0.8, 0.957):.3f}')")
+    WEIGHT_DECAY=$(python3 -c "import random; random.seed($RANDOM_SEED + 4); print(f'{random.uniform(0.0001, 0.001):.6f}')")
     
     # Loss weights
-    BOX=$(LC_NUMERIC="C" printf "%.3f" $(echo "scale=3; 0.02 + ($RANDOM % 80) / 1000" | bc))       # 0.02 ~ 0.1
-    CLS=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.1 + ($RANDOM % 80) / 100" | bc))         # 0.1 ~ 0.9
-    OBJ=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.3 + ($RANDOM % 120) / 100" | bc))        # 0.3 ~ 1.5
+    BOX=$(python3 -c "import random; random.seed($RANDOM_SEED + 5); print(f'{random.uniform(0.02, 0.1):.3f}')")
+    CLS=$(python3 -c "import random; random.seed($RANDOM_SEED + 6); print(f'{random.uniform(0.1, 0.9):.2f}')")
+    OBJ=$(python3 -c "import random; random.seed($RANDOM_SEED + 7); print(f'{random.uniform(0.3, 1.5):.2f}')")
     
     # Color augmentation
-    HSV_H=$(LC_NUMERIC="C" printf "%.3f" $(echo "scale=3; 0.005 + ($RANDOM % 25) / 1000" | bc))    # 0.005 ~ 0.03
-    HSV_S=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.3 + ($RANDOM % 70) / 100" | bc))       # 0.3 ~ 1.0
-    HSV_V=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.2 + ($RANDOM % 60) / 100" | bc))       # 0.2 ~ 0.8
+    HSV_H=$(python3 -c "import random; random.seed($RANDOM_SEED + 8); print(f'{random.uniform(0.005, 0.03):.3f}')")
+    HSV_S=$(python3 -c "import random; random.seed($RANDOM_SEED + 9); print(f'{random.uniform(0.3, 1.0):.2f}')")
+    HSV_V=$(python3 -c "import random; random.seed($RANDOM_SEED + 10); print(f'{random.uniform(0.2, 0.8):.2f}')")
     
     # Geometric augmentation
-    TRANSLATE=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.05 + ($RANDOM % 15) / 100" | bc))  # 0.05 ~ 0.2
-    SCALE=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.5 + ($RANDOM % 90) / 100" | bc))       # 0.5 ~ 1.4
-    FLIPLR=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.0 + ($RANDOM % 80) / 100" | bc))      # 0.0 ~ 0.8
+    TRANSLATE=$(python3 -c "import random; random.seed($RANDOM_SEED + 11); print(f'{random.uniform(0.05, 0.2):.2f}')")
+    SCALE=$(python3 -c "import random; random.seed($RANDOM_SEED + 12); print(f'{random.uniform(0.5, 1.4):.2f}')")
+    FLIPLR=$(python3 -c "import random; random.seed($RANDOM_SEED + 13); print(f'{random.uniform(0.0, 0.8):.2f}')")
     
     # Advanced augmentation
-    MOSAIC=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.0 + ($RANDOM % 50) / 100" | bc))      # 0.5 ~ 1.0
-    MIXUP=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.0 + ($RANDOM % 30) / 100" | bc))       # 0.0 ~ 0.3
-    COPY_PASTE=$(LC_NUMERIC="C" printf "%.2f" $(echo "scale=2; 0.0 + ($RANDOM % 20) / 100" | bc))  # 0.0 ~ 0.2
+    MOSAIC=$(python3 -c "import random; random.seed($RANDOM_SEED + 14); print(f'{random.uniform(0.0, 1.0):.2f}')")
+    MIXUP=$(python3 -c "import random; random.seed($RANDOM_SEED + 15); print(f'{random.uniform(0.0, 0.3):.2f}')")
+    COPY_PASTE=$(python3 -c "import random; random.seed($RANDOM_SEED + 16); print(f'{random.uniform(0.0, 0.2):.2f}')")
 
     # 7. sed 명령어로 임시 파일의 값을 변경
     sed -i "s/lr0: .*/lr0: $LR0/" $TEMP_HYP_FILE
@@ -100,7 +103,7 @@ do
     TRIAL_NAME="random_trial_$TRIAL_TIMESTAMP"
     echo "Starting training for trial $i (ID: $TRIAL_TIMESTAMP)..."
     
-    CUDA_VISIBLE_DEVICES=2 python train.py \
+    CUDA_VISIBLE_DEVICES=1 python train.py \
         --data datasets/kaist-rgbt/kfold_splits/yaml_configs/kaist-rgbt-fold1.yaml \
         --cfg models/yolov5s_kaist-rgbt.yaml \
         --weights yolov5s.pt \
