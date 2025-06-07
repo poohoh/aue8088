@@ -1095,8 +1095,8 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         super().__init__(path, **kwargs)
 
-        # TODO: make mosaic augmentation work
-        self.mosaic = False
+        # make mosaic augmentation work
+        self.mosaic = True
 
         # Set ignore flag
         cond = self.ignore_settings['train' if is_train else 'test']
@@ -1207,11 +1207,11 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         # --- Stage 1: Prepare base images (in a list) and labels ---
         if mosaic:
-            # TODO: Load mosaic
+            # Load mosaic
             img, labels = self.load_mosaic(index)
             shapes = None
             
-            # TODO: MixUp augmentation
+            # MixUp augmentation
             if random.random() < hyp["mixup"]:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
             
