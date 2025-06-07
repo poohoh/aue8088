@@ -4,18 +4,18 @@
 # Based on hyperparameter files in data/hyps/
 
 # 1. 총 몇 번의 랜덤 서치를 수행할지 결정
-NUM_TRIALS=30
+NUM_TRIALS=20
 
 # 2. 기본 하이퍼파라미터 파일 지정
 BASE_HYP_FILE="data/hyps/hyp.scratch-med.yaml"
 
 # 3. 결과 저장을 위한 디렉토리 생성
-RESULTS_DIR="runs/random_search_$(date +%Y%m%d_%H%M%S)"
+RESULTS_DIR="runs/random_search"
 mkdir -p $RESULTS_DIR
 
 # 4. 랜덤 서치 결과를 기록할 CSV 파일 생성
 RESULTS_CSV="$RESULTS_DIR/random_search_results.csv"
-echo "trial,lr0,lrf,momentum,weight_decay,box,cls,obj,hsv_h,hsv_s,hsv_v,translate,scale,fliplr,mosaic,mixup,copy_paste,mAP50,mAP50-95" > $RESULTS_CSV
+echo "trial_id,lr0,lrf,momentum,weight_decay,box,cls,obj,hsv_h,hsv_s,hsv_v,translate,scale,fliplr,mosaic,mixup,copy_paste,mAP50,mAP50-95" > $RESULTS_CSV
 
 echo "Starting Random Search with $NUM_TRIALS trials"
 echo "Results will be saved in: $RESULTS_DIR"
@@ -27,7 +27,13 @@ do
     echo "==========================================="
 
     # 5. 임시 하이퍼파라미터 파일 생성
-    TEMP_HYP_FILE="data/hyps/hyp-random-trial-$i.yaml"
+    # 임시 하이퍼파라미터 파일을 위한 폴더 생성
+    TEMP_HYP_DIR="data/hyps/random_trials"
+    mkdir -p $TEMP_HYP_DIR
+    
+    # 시작 시간을 기반으로 한 고유 식별자 생성
+    TRIAL_TIMESTAMP=$(date +%Y%m%d_%H%M%S | cut -c1-20)
+    TEMP_HYP_FILE="$TEMP_HYP_DIR/hyp-random-trial-$TRIAL_TIMESTAMP.yaml"
     cp $BASE_HYP_FILE $TEMP_HYP_FILE
 
     # 6. 랜덤 값 생성 (다양한 하이퍼파라미터들)
@@ -85,13 +91,16 @@ do
     echo "  mosaic=$MOSAIC, mixup=$MIXUP, copy_paste=$COPY_PASTE"
 
     # 8. 생성된 하이퍼파라미터 파일을 결과 디렉토리에 백업
-    cp $TEMP_HYP_FILE "$RESULTS_DIR/hyp-trial-$i.yaml"
+    # 결과 디렉토리에도 하이퍼파라미터 파일들을 위한 폴더 생성
+    BACKUP_HYP_DIR="$RESULTS_DIR/hyperparameters"
+    mkdir -p $BACKUP_HYP_DIR
+    cp $TEMP_HYP_FILE "$BACKUP_HYP_DIR/hyp-trial-$TRIAL_TIMESTAMP.yaml"
 
     # 9. YOLOv5 학습 실행
-    TRIAL_NAME="random_trial_${i}"
-    echo "Starting training for trial $i..."
+    TRIAL_NAME="random_trial_$TRIAL_TIMESTAMP"
+    echo "Starting training for trial $i (ID: $TRIAL_TIMESTAMP)..."
     
-    CUDA_VISIBLE_DEVICES=5 python train.py \
+    CUDA_VISIBLE_DEVICES=2 python train.py \
         --data datasets/kaist-rgbt/kfold_splits/yaml_configs/kaist-rgbt-fold1.yaml \
         --cfg models/yolov5s_kaist-rgbt.yaml \
         --weights yolov5s.pt \
@@ -113,19 +122,19 @@ do
         MAP50=$(echo $LAST_LINE | cut -d',' -f7)        # mAP@0.5
         MAP50_95=$(echo $LAST_LINE | cut -d',' -f8)     # mAP@0.5:0.95
         
-        # CSV에 결과 기록
-        echo "$i,$LR0,$LRF,$MOMENTUM,$WEIGHT_DECAY,$BOX,$CLS,$OBJ,$HSV_H,$HSV_S,$HSV_V,$TRANSLATE,$SCALE,$FLIPLR,$MOSAIC,$MIXUP,$COPY_PASTE,$MAP50,$MAP50_95" >> $RESULTS_CSV
+        # CSV에 결과 기록 (trial ID로 timestamp 사용)
+        echo "$TRIAL_TIMESTAMP,$LR0,$LRF,$MOMENTUM,$WEIGHT_DECAY,$BOX,$CLS,$OBJ,$HSV_H,$HSV_S,$HSV_V,$TRANSLATE,$SCALE,$FLIPLR,$MOSAIC,$MIXUP,$COPY_PASTE,$MAP50,$MAP50_95" >> $RESULTS_CSV
         
-        echo "Trial $i completed - mAP@0.5: $MAP50, mAP@0.5:0.95: $MAP50_95"
+        echo "Trial $i (ID: $TRIAL_TIMESTAMP) completed - mAP@0.5: $MAP50, mAP@0.5:0.95: $MAP50_95"
     else
-        echo "Warning: Results file not found for trial $i"
-        echo "$i,$LR0,$LRF,$MOMENTUM,$WEIGHT_DECAY,$BOX,$CLS,$OBJ,$HSV_H,$HSV_S,$HSV_V,$TRANSLATE,$SCALE,$FLIPLR,$MOSAIC,$MIXUP,$COPY_PASTE,N/A,N/A" >> $RESULTS_CSV
+        echo "Warning: Results file not found for trial $i (ID: $TRIAL_TIMESTAMP)"
+        echo "$TRIAL_TIMESTAMP,$LR0,$LRF,$MOMENTUM,$WEIGHT_DECAY,$BOX,$CLS,$OBJ,$HSV_H,$HSV_S,$HSV_V,$TRANSLATE,$SCALE,$FLIPLR,$MOSAIC,$MIXUP,$COPY_PASTE,N/A,N/A" >> $RESULTS_CSV
     fi
 
     # 11. 임시 하이퍼파라미터 파일 정리
     rm $TEMP_HYP_FILE
 
-    echo "--- Finished Trial $i ---"
+    echo "--- Finished Trial $i (ID: $TRIAL_TIMESTAMP) ---"
     echo ""
 done
 
@@ -149,7 +158,7 @@ if os.path.exists(results_file):
     if not df_valid.empty:
         df_valid['mAP50-95'] = pd.to_numeric(df_valid['mAP50-95'])
         best_trial = df_valid.loc[df_valid['mAP50-95'].idxmax()]
-        print(f"Best Trial: {best_trial['trial']}")
+        print(f"Best Trial ID: {best_trial['trial_id']}")
         print(f"Best mAP@0.5:0.95: {best_trial['mAP50-95']:.4f}")
         print(f"Best mAP@0.5: {best_trial['mAP50']:.4f}")
         print("Best Hyperparameters:")
