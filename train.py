@@ -474,9 +474,9 @@ def train(hyp, opt, device, callbacks):
                 }
 
                 # Save last, best and delete
-                torch.save(ckpt, last)
+                torch.save(ckpt, w / f"last_epoch_{epoch + 1}.pt")
                 if best_fitness == fi:
-                    torch.save(ckpt, best)
+                    torch.save(ckpt, w / f"best_epoch_{epoch + 1}.pt")
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f"epoch{epoch}.pt")
                 del ckpt
