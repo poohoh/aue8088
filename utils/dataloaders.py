@@ -1281,22 +1281,19 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         # --- Stage 2: Apply common augmentations to all prepared images ---
         # This block now runs for BOTH mosaic and non-mosaic paths
         if self.augment:
-            # HSV and Flips are applied to all images in the list
-            augmented_imgs = []
-            for img in imgs:
-                # HSV color-space augmentation
-                augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
-                
+            # Apply HSV augmentation only to visible image (imgs[1])
+            if len(imgs) > 1:  # Safety check
+                augment_hsv(imgs[1], hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+            
+            # Apply geometric augmentations to all images
+            for i in range(len(imgs)):
                 # Flip up-down (consistent across modalities)
                 if flip_ud:
-                    img = np.flipud(img)
+                    imgs[i] = np.flipud(imgs[i])
                 
                 # Flip left-right (consistent across modalities)
                 if flip_lr:
-                    img = np.fliplr(img)
-                
-                augmented_imgs.append(img)
-            imgs = augmented_imgs
+                    imgs[i] = np.fliplr(imgs[i])
 
             # Update labels for flips (only needs to be done once)
             if nl:

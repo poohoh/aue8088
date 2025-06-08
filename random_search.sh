@@ -7,10 +7,10 @@
 NUM_TRIALS=20
 
 # 2. 기본 하이퍼파라미터 파일 지정
-BASE_HYP_FILE="data/hyps/hyp.scratch-med.yaml"
+BASE_HYP_FILE="data/hyps/hyp.scratch-low.yaml"
 
 # 3. 결과 저장을 위한 디렉토리 생성
-RESULTS_DIR="runs/random_search"
+RESULTS_DIR="runs/random_search_low"
 mkdir -p $RESULTS_DIR
 
 # 4. 랜덤 서치 결과를 기록할 CSV 파일 생성
@@ -41,32 +41,32 @@ do
     RANDOM_SEED=$(($(date +%s%N | cut -b1-10) + $$ + $i))
     RANDOM=$RANDOM_SEED
     # Learning rate parameters
-    LR0=$(python3 -c "import random; random.seed($RANDOM_SEED + 1); print(f'{random.uniform(0.001, 0.02):.6f}')")
-    LRF=$(python3 -c "import random; random.seed($RANDOM_SEED + 2); print(f'{random.uniform(0.01, 0.2):.3f}')")
+    LR0=$(python3 -c "import random; random.seed($RANDOM_SEED + 1); print(f'{random.uniform(0.005, 0.02):.6f}')")
+    LRF=$(python3 -c "import random; random.seed($RANDOM_SEED + 2); print(f'{random.uniform(0.005, 0.05):.3f}')")
     
     # Optimizer parameters
-    MOMENTUM=$(python3 -c "import random; random.seed($RANDOM_SEED + 3); print(f'{random.uniform(0.8, 0.957):.3f}')")
+    MOMENTUM=$(python3 -c "import random; random.seed($RANDOM_SEED + 3); print(f'{random.uniform(0.90, 0.97):.3f}')")
     WEIGHT_DECAY=$(python3 -c "import random; random.seed($RANDOM_SEED + 4); print(f'{random.uniform(0.0001, 0.001):.6f}')")
     
-    # Loss weights
+    # Loss weights (adjusted for low-augmentation baseline)
     BOX=$(python3 -c "import random; random.seed($RANDOM_SEED + 5); print(f'{random.uniform(0.02, 0.1):.3f}')")
-    CLS=$(python3 -c "import random; random.seed($RANDOM_SEED + 6); print(f'{random.uniform(0.1, 0.9):.2f}')")
-    OBJ=$(python3 -c "import random; random.seed($RANDOM_SEED + 7); print(f'{random.uniform(0.3, 1.5):.2f}')")
+    CLS=$(python3 -c "import random; random.seed($RANDOM_SEED + 6); print(f'{random.uniform(0.35, 0.6):.2f}')")  # low baseline: 0.5
+    OBJ=$(python3 -c "import random; random.seed($RANDOM_SEED + 7); print(f'{random.uniform(0.8, 1.2):.2f}')")  # low baseline: 1.0
     
     # Color augmentation
-    HSV_H=$(python3 -c "import random; random.seed($RANDOM_SEED + 8); print(f'{random.uniform(0.005, 0.03):.3f}')")
-    HSV_S=$(python3 -c "import random; random.seed($RANDOM_SEED + 9); print(f'{random.uniform(0.3, 1.0):.2f}')")
-    HSV_V=$(python3 -c "import random; random.seed($RANDOM_SEED + 10); print(f'{random.uniform(0.2, 0.8):.2f}')")
+    HSV_H=$(python3 -c "import random; random.seed($RANDOM_SEED + 8); print(f'{random.uniform(0.005, 0.02):.3f}')")
+    HSV_S=$(python3 -c "import random; random.seed($RANDOM_SEED + 9); print(f'{random.uniform(0.3, 0.8):.2f}')")
+    HSV_V=$(python3 -c "import random; random.seed($RANDOM_SEED + 10); print(f'{random.uniform(0.2, 0.6):.2f}')")
     
-    # Geometric augmentation
-    TRANSLATE=$(python3 -c "import random; random.seed($RANDOM_SEED + 11); print(f'{random.uniform(0.05, 0.2):.2f}')")
-    SCALE=$(python3 -c "import random; random.seed($RANDOM_SEED + 12); print(f'{random.uniform(0.5, 1.4):.2f}')")
-    FLIPLR=$(python3 -c "import random; random.seed($RANDOM_SEED + 13); print(f'{random.uniform(0.0, 0.8):.2f}')")
+    # Geometric augmentation (adjusted for low-augmentation baseline)
+    TRANSLATE=$(python3 -c "import random; random.seed($RANDOM_SEED + 11); print(f'{random.uniform(0.05, 0.15):.2f}')")  # low baseline: 0.1
+    SCALE=$(python3 -c "import random; random.seed($RANDOM_SEED + 12); print(f'{random.uniform(0.3, 0.8):.2f}')")       # low baseline: 0.5
+    FLIPLR=$(python3 -c "import random; random.seed($RANDOM_SEED + 13); print(f'{random.uniform(0.2, 0.8):.2f}')")      # low baseline: 0.5
     
-    # Advanced augmentation
-    MOSAIC=$(python3 -c "import random; random.seed($RANDOM_SEED + 14); print(f'{random.uniform(0.0, 1.0):.2f}')")
-    MIXUP=$(python3 -c "import random; random.seed($RANDOM_SEED + 15); print(f'{random.uniform(0.0, 0.3):.2f}')")
-    COPY_PASTE=$(python3 -c "import random; random.seed($RANDOM_SEED + 16); print(f'{random.uniform(0.0, 0.2):.2f}')")
+    # Advanced augmentation (adjusted for low-augmentation baseline)
+    MOSAIC=$(python3 -c "import random; random.seed($RANDOM_SEED + 14); print(f'{random.uniform(0.5, 1.0):.2f}')")      # low baseline: 1.0
+    MIXUP=$(python3 -c "import random; random.seed($RANDOM_SEED + 15); print(f'{random.uniform(0.0, 0.2):.2f}')")       # low baseline: 0.0
+    COPY_PASTE=$(python3 -c "import random; random.seed($RANDOM_SEED + 16); print(f'{random.uniform(0.0, 0.2):.2f}')")  # low baseline: 0.1
 
     # 7. sed 명령어로 임시 파일의 값을 변경
     sed -i "s/lr0: .*/lr0: $LR0/" $TEMP_HYP_FILE
@@ -103,7 +103,7 @@ do
     TRIAL_NAME="random_trial_$TRIAL_TIMESTAMP"
     echo "Starting training for trial $i (ID: $TRIAL_TIMESTAMP)..."
     
-    CUDA_VISIBLE_DEVICES=1 python train.py \
+    CUDA_VISIBLE_DEVICES=5 python train.py \
         --data datasets/kaist-rgbt/kfold_splits/yaml_configs/kaist-rgbt-fold1.yaml \
         --cfg models/yolov5s_kaist-rgbt.yaml \
         --weights yolov5s.pt \
