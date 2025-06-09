@@ -41,6 +41,8 @@ data/images/*
 results*.csv
 
 YOLOv5/
+test/
+data/hyps/random_trials
 
 # Datasets -------------------------------------------------------------------------------------------------------------
 datasets/
