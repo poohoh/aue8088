@@ -35,8 +35,7 @@ from utils.augmentations import (
     letterbox,
     mixup,
     random_perspective,
-    random_perspective_rgbt,
-    mixup_rgbt
+    box_candidates,
 )
 from utils.general import (
     DATASETS_DIR,
@@ -1096,7 +1095,8 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         super().__init__(path, **kwargs)
 
-        print(self.mosaic)
+        # TODO: make mosaic augmentation work
+        # self.mosaic = False  # comment out
 
         # Set ignore flag
         cond = self.ignore_settings['train' if is_train else 'test']
@@ -1195,164 +1195,97 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                 np.save(f.as_posix(), cv2.imread(self.im_files[i].format(m)))
 
     def __getitem__(self, index):
-        """Fetches the dataset item at the given index with RGB-T augmentation support."""
+        """Fetches the dataset item at the given index, considering linear, shuffled, or weighted sampling."""
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
         if mosaic:
+            # raise NotImplementedError('Please make "mosaic" augmentation work!')
+
             # Load mosaic
-            imgs, labels = self.load_mosaic_rgbt(index)
+            imgs, labels = self.load_mosaic(index)
             shapes = None
 
             # MixUp augmentation
             if random.random() < hyp["mixup"]:
-                imgs2, labels2 = self.load_mosaic_rgbt(random.choice(self.indices))
-                imgs, labels = mixup_rgbt(imgs, labels, imgs2, labels2)
-
+                img2, labels2 = self.load_mosaic(random.randint(0, self.n - 1))
+                r = np.random.beta(8.0, 8.0)  # TODO: mixup ratio?
+                imgs[0] = np.clip(imgs[0] * r + img2[0] * (1 - r), 0, 255).astype(np.uint8)
+                imgs[1] = np.clip(imgs[1] * r + img2[1] * (1 - r), 0, 255).astype(np.uint8)
+                labels = np.concatenate((labels, labels2), 0)
         else:
             # Load image
             # hw0s: original shapes, hw1s: resized shapes
-            imgs, hw0s, hw1s = self.load_image(index)
+            imgs, (h0s, w0s), (h1s, w1s) = self.load_image(index)
 
-            # Process both thermal and visible images
+            # letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            
-            # Apply letterbox to both images with same parameters
-            img_lwir, ratio, pad = letterbox(imgs[0], shape, auto=False, scaleup=self.augment)
-            img_vis, _, _ = letterbox(imgs[1], shape, auto=False, scaleup=self.augment)
-            imgs = [img_lwir, img_vis]
-            
-            shapes = ((hw0s[0][0], hw0s[1][0]), (ratio, pad))  # for COCO mAP rescaling
+            lwir_img, ratio, pad = letterbox(imgs[0], shape, auto=False, scaleup=self.augment)
+            rgb_img, _, _ = letterbox(imgs[1], shape, auto=False, scaleup=self.augment)
+            imgs = [lwir_img, rgb_img]  # list of images
+            shapes = (h0s[0], w0s[0]), (ratio, pad)  # for COCO mAP rescaling
 
             labels = self.labels[index].copy()
-            if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * hw1s[0][1], ratio[1] * hw1s[0][0], padw=pad[0], padh=pad[1])
-
+            if len(labels):
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w1s[0], ratio[1] * h1s[0], padw=pad[0], padh=pad[1])
+            
+            # Random perspective augmentation
             if self.augment:
-                # Apply same augmentation to both images
-                imgs, labels = random_perspective_rgbt(
+                imgs, labels = self.random_perspective_rgbt(
                     imgs,
                     labels,
-                    degrees=hyp["degrees"],
-                    translate=hyp["translate"],
-                    scale=hyp["scale"],
-                    shear=hyp["shear"],
-                    perspective=hyp["perspective"],
+                    degrees=self.hyp['degrees'],
+                    translate=self.hyp['translate'],
+                    scale=self.hyp['scale'],
+                    shear=self.hyp['shear'],
+                    perspective=self.hyp['perspective'],
+                    border=self.mosaic_border,
                 )
-
+            
         nl = len(labels)  # number of labels
         if nl:
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=imgs[0].shape[1], h=imgs[0].shape[0], clip=True, eps=1e-3)
 
         if self.augment:
-            # Albumentations (apply same transform to both images)
-            if self.albumentations:
-                imgs[0], labels = self.albumentations(imgs[0], labels)
-                imgs[1], _ = self.albumentations(imgs[1], labels)
-                nl = len(labels)  # update after albumentations
+            # Albumentations
+            # imgs, labels = self.albumentations(imgs, labels)
+            # nl = len(labels)  # update after albumentations
 
-            # HSV color-space augmentation (only for visible image)
+            # HSV color-space
             augment_hsv(imgs[1], hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
 
-            # Flip up-down (both images)
+            # Flip up-down
             if random.random() < hyp["flipud"]:
                 imgs[0] = np.flipud(imgs[0])
                 imgs[1] = np.flipud(imgs[1])
                 if nl:
                     labels[:, 2] = 1 - labels[:, 2]
 
-            # Flip left-right (both images)
+            # Flip left-right
             if random.random() < hyp["fliplr"]:
                 imgs[0] = np.fliplr(imgs[0])
                 imgs[1] = np.fliplr(imgs[1])
                 if nl:
                     labels[:, 1] = 1 - labels[:, 1]
 
+            # Cutouts
+            # labels = cutout(img, labels, p=0.5)
+            # nl = len(labels)  # update after cutout
+
         labels_out = torch.zeros((nl, 7))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        # Convert both images
-        for i in range(2):
-            imgs[i] = imgs[i].transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-            imgs[i] = np.ascontiguousarray(imgs[i])
-            imgs[i] = torch.from_numpy(imgs[i])
+        # Convert
+        imgs = [img.transpose((2, 0, 1))[::-1] for img in imgs]  # HWC to CHW, BGR to RGB
+        imgs = [np.ascontiguousarray(img) for img in imgs]
+
+        imgs = [torch.from_numpy(img) for img in imgs]  # convert to torch tensors
 
         # Drop occlusion level
         labels_out = labels_out[:, :-1]
         return imgs, labels_out, self.im_files[index], shapes, index
-
-    def load_mosaic_rgbt(self, index):
-        """Loads a 4-image mosaic for RGB-T pairs."""
-        labels4, segments4 = [], []
-        s = self.img_size
-        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
-        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
-        random.shuffle(indices)
-        
-        # Initialize mosaic images for both modalities
-        img4_lwir = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
-        img4_vis = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
-        
-        for i, idx in enumerate(indices):
-            # Load RGB-T image pair
-            imgs, _, _ = self.load_image(idx)
-            img_lwir, img_vis = imgs[0], imgs[1]
-            # 로드된 이미지의 shape에서 직접 높이(h)와 너비(w)를 가져옵니다.
-            h, w = img_lwir.shape[:2]
-
-            # Place img in img4
-            if i == 0:  # top left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
-            elif i == 1:  # top right
-                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
-                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
-            elif i == 2:  # bottom left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
-            elif i == 3:  # bottom right
-                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
-
-            # Apply to both images
-            img4_lwir[y1a:y2a, x1a:x2a] = img_lwir[y1b:y2b, x1b:x2b]
-            img4_vis[y1a:y2a, x1a:x2a] = img_vis[y1b:y2b, x1b:x2b]
-            
-            padw = x1a - x1b
-            padh = y1a - y1b
-
-            # Labels
-            labels, segments = self.labels[idx].copy(), self.segments[idx].copy()
-            if labels.size:
-                labels[:, 1:3] += labels[:, 3:5] / 2.0  # convert to center format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
-                segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
-            labels4.append(labels)
-            segments4.extend(segments)
-
-        # Concat/clip labels
-        labels4 = np.concatenate(labels4, 0)
-        for x in (labels4[:, 1:], *segments4):
-            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
-
-        # Augment
-        imgs = [img4_lwir, img4_vis]
-        imgs, labels4 = random_perspective_rgbt(
-            imgs,
-            labels4,
-            segments4,
-            degrees=self.hyp["degrees"],
-            translate=self.hyp["translate"],
-            scale=self.hyp["scale"],
-            shear=self.hyp["shear"],
-            perspective=self.hyp["perspective"],
-            border=self.mosaic_border,
-        )
-
-        return imgs, labels4
 
     def load_image(self, i):
         """
@@ -1387,7 +1320,131 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
             return imgs, (h0s, w0s), img_shapes
 
         return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
+    
+    def load_mosaic(self, index):
+        labels4 = []
+        s = self.img_size
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
+        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+        random.shuffle(indices)
 
+        for i, index in enumerate(indices):
+            img, _, _ = self.load_image(index)
+            h, w = img[0].shape[:2]
+
+            if i == 0:  # top-left
+                # 두 개의 모자이크 캔버스 생성 (LWIR, RGB 용)
+                img4_lwir = np.full((s * 2, s * 2, img[0].shape[2]), 114, dtype=np.uint8)
+                img4_rgb = np.full((s * 2, s * 2, img[1].shape[2]), 114, dtype=np.uint8)
+                # 이미지와 레이블의 위치(x, y) 계산
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+            elif i == 1:  # top-right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom-left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            elif i == 3:  # bottom-right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(h, y2a - y1a)
+
+            # 계산된 위치에 이미지 삽입 (LWIR과 RGB 각각)
+            img4_lwir[y1a:y2a, x1a:x2a] = img[0][y1b:y2b, x1b:x2b]
+            img4_rgb[y1a:y2a, x1a:x2a] = img[1][y1b:y2b, x1b:x2b]
+            
+            # 레이블 좌표 변환
+            padw = x1a - x1b
+            padh = y1a - y1b
+            labels = self.labels[index].copy()
+            if labels.size:
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)
+            labels4.append(labels)
+        
+        # 4개 이미지의 레이블을 하나로 합침
+        labels4 = np.concatenate(labels4, 0)
+        # 중복 레이블 제거
+        labels4[:, 1:] = np.clip(labels4[:, 1:], 0, 2 * s)
+
+        # 최종 모자이크 이미지를 리스트로 묶음
+        img4 = [img4_lwir, img4_rgb]
+
+        img4, labels4 = self.random_perspective_rgbt(img4, labels4,
+                                                     degrees=self.hyp['degrees'],
+                                                     translate=self.hyp['translate'],
+                                                     scale=self.hyp['scale'],
+                                                     shear=self.hyp['shear'],
+                                                     perspective=self.hyp['perspective'],
+                                                     border=self.mosaic_border,
+                                                    )
+        
+        return img4, labels4
+        
+    def random_perspective_rgbt(self, imgs, targets=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
+                                border=(0, 0)):
+        """ RGBT 데이터에 동일한 변환 적용 """
+        lwir_img, rgb_img = imgs
+        
+        # 높이와 너비는 동일
+        height = lwir_img.shape[0] + border[0] * 2  # shape(h,w,c)
+        width = lwir_img.shape[1] + border[1] * 2
+
+        # 변환 행렬 계산 (이 부분은 동일하게 유지)
+        C = np.eye(3)
+        C[0, 2] = -lwir_img.shape[1] / 2  # x translation (pixels)
+        C[1, 2] = -lwir_img.shape[0] / 2  # y translation (pixels)
+
+        P = np.eye(3)
+        P[2, 0] = random.uniform(-perspective, perspective)  # perspective
+        P[2, 1] = random.uniform(-perspective, perspective)  # perspective
+
+        R = np.eye(3)
+        a = random.uniform(-degrees, degrees)
+        s = random.uniform(1 - scale, 1 + scale)
+        R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
+
+        S = np.eye(3)
+        S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
+        S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
+
+        T = np.eye(3)
+        T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width   # x translation (pixels)
+        T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
+        
+        M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+        
+        # ** LWIR과 RGB 이미지에 동일한 변환 행렬(M) 적용 **
+        if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
+            if perspective:
+                lwir_img = cv2.warpPerspective(lwir_img, M, dsize=(width, height), borderValue=(114, 114, 114))
+                rgb_img = cv2.warpPerspective(rgb_img, M, dsize=(width, height), borderValue=(114, 114, 114))
+            else:  # affine
+                lwir_img = cv2.warpAffine(lwir_img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+                rgb_img = cv2.warpAffine(rgb_img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+        
+        # 레이블 변환 (기존 코드와 동일)
+        n = len(targets)
+        if n:
+            xy = np.ones((n * 4, 3))
+            xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+            xy = xy @ M.T  # transform
+            xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
+
+            # create new boxes
+            x = xy[:, [0, 2, 4, 6]]
+            y = xy[:, [1, 3, 5, 7]]
+            new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+
+            # clip
+            new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
+            new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
+
+            # filter candidates
+            i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.10)
+            targets = targets[i]
+            targets[:, 1:5] = new[i]
+            
+        return [lwir_img, rgb_img], targets
 
     @staticmethod
     def collate_fn(batch):

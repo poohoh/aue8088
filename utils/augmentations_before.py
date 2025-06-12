@@ -150,36 +150,6 @@ def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleF
     im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
     return im, ratio, (dw, dh)
 
-def letterbox_rgbt(imgs, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True, stride=32):
-    """RGB-T 이미지 쌍에 동일한 letterbox 적용"""
-    if not isinstance(imgs, list):
-        return letterbox(imgs, new_shape, color, auto, scaleFill, scaleup, stride)
-    
-    # 첫 번째 이미지로 파라미터 계산
-    img, ratio, pad = letterbox(imgs[0], new_shape, color, auto, scaleFill, scaleup, stride)
-    result = [img]
-    
-    # 나머지 이미지들에 동일한 파라미터 적용
-    for i in range(1, len(imgs)):
-        shape = imgs[i].shape[:2]  # current shape [height, width]
-        if isinstance(new_shape, int):
-            new_shape = (new_shape, new_shape)
-
-        # 동일한 ratio와 pad 사용
-        new_unpad = int(round(shape[1] * ratio[0])), int(round(shape[0] * ratio[1]))
-        dw, dh = pad
-        
-        if shape[::-1] != new_unpad:  # resize
-            img = cv2.resize(imgs[i], new_unpad, interpolation=cv2.INTER_LINEAR)
-        else:
-            img = imgs[i]
-            
-        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-        result.append(img)
-    
-    return result, ratio, pad
 
 def random_perspective(
     im, targets=(), segments=(), degrees=10, translate=0.1, scale=0.1, shear=10, perspective=0.0, border=(0, 0)
@@ -327,106 +297,27 @@ def cutout(im, labels, p=0.5):
 
     return labels
 
-def mixup_rgbt(imgs1, labels1, imgs2, labels2):
-    """Apply MixUp augmentation to RGB-T image pairs."""
-    r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
-    imgs = [(imgs1[0] * r + imgs2[0] * (1 - r)).astype(np.uint8),
-            (imgs1[1] * r + imgs2[1] * (1 - r)).astype(np.uint8)]
-    labels = np.concatenate((labels1, labels2), 0)
-    return imgs, labels
-
-def random_perspective_rgbt(imgs, targets=(), segments=(), degrees=10, translate=0.1, 
-                            scale=0.1, shear=10, perspective=0.0, border=(0, 0)):
-        """Apply random perspective transformation to RGB-T image pairs with same parameters."""
-        
-        # Get dimensions from first image
-        height = imgs[0].shape[0] + border[0] * 2
-        width = imgs[0].shape[1] + border[1] * 2
-
-        # Center
-        C = np.eye(3)
-        C[0, 2] = -imgs[0].shape[1] / 2  # x translation (pixels)
-        C[1, 2] = -imgs[0].shape[0] / 2  # y translation (pixels)
-
-        # Perspective
-        P = np.eye(3)
-        P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
-        P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
-
-        # Rotation and Scale
-        R = np.eye(3)
-        a = random.uniform(-degrees, degrees)
-        s = random.uniform(1 - scale, 1 + scale)
-        R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
-
-        # Shear
-        S = np.eye(3)
-        S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
-        S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
-
-        # Translation
-        T = np.eye(3)
-        T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
-        T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
-
-        # Combined rotation matrix
-        M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
-        
-        # Apply to both images
-        if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
-            if perspective:
-                imgs[0] = cv2.warpPerspective(imgs[0], M, dsize=(width, height), borderValue=(114, 114, 114))
-                imgs[1] = cv2.warpPerspective(imgs[1], M, dsize=(width, height), borderValue=(114, 114, 114))
-            else:  # affine
-                imgs[0] = cv2.warpAffine(imgs[0], M[:2], dsize=(width, height), borderValue=(114, 114, 114))
-                imgs[1] = cv2.warpAffine(imgs[1], M[:2], dsize=(width, height), borderValue=(114, 114, 114))
-
-        # Transform label coordinates
-        n = len(targets)
-        if n:
-            use_segments = any(x.any() for x in segments) and len(segments) == n
-            new = np.zeros((n, 4))
-            if use_segments:  # warp segments
-                segments = resample_segments(segments)  # upsample
-                for i, segment in enumerate(segments):
-                    xy = np.ones((len(segment), 3))
-                    xy[:, :2] = segment
-                    xy = xy @ M.T  # transform
-                    xy = xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]  # perspective rescale or affine
-
-                    # clip
-                    new[i] = segment2box(xy, width, height)
-
-            else:  # warp boxes
-                xy = np.ones((n * 4, 3))
-                xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
-                xy = xy @ M.T  # transform
-                xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
-
-                # create new boxes
-                x = xy[:, [0, 2, 4, 6]]
-                y = xy[:, [1, 3, 5, 7]]
-                new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
-
-                # clip
-                new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
-                new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
-
-            # filter candidates
-            i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
-            targets = targets[i]
-            targets[:, 1:5] = new[i]
-
-        return imgs, targets
 
 def mixup(im, labels, im2, labels2):
     """
     Applies MixUp augmentation by blending images and labels.
+    Supports both single images and RGBT (list of images).
 
     See https://arxiv.org/pdf/1710.09412.pdf for details.
     """
     r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
-    im = (im * r + im2 * (1 - r)).astype(np.uint8)
+    
+    # Handle RGBT case (list of images)
+    if isinstance(im, list) and isinstance(im2, list):
+        mixed_images = []
+        for img1, img2 in zip(im, im2):
+            mixed_img = (img1 * r + img2 * (1 - r)).astype(np.uint8)
+            mixed_images.append(mixed_img)
+        im = mixed_images
+    else:
+        # Handle single image case
+        im = (im * r + im2 * (1 - r)).astype(np.uint8)
+    
     labels = np.concatenate((labels, labels2), 0)
     return im, labels
 
