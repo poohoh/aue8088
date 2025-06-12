@@ -132,7 +132,7 @@ def train(hyp, opt, device, callbacks):
     # Config
     init_seeds(opt.seed, deterministic=True)
     data_dict = data_dict or check_dataset(data)  # check if None
-    train_path, val_path = data_dict["train"], data_dict["val"]
+    train_path, val_path = data_dict["train"], data_dict["test"]
     nc = 1 if single_cls else int(data_dict["nc"])  # number of classes
     names = {0: data_dict["names"][0]} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]  # class names
 
@@ -185,7 +185,7 @@ def train(hyp, opt, device, callbacks):
         gs,
         single_cls,
         hyp=hyp,
-        augment=True,      # TODO: make it work
+        augment=False,      # TODO: make it work
         cache=None if opt.cache == "val" else opt.cache,
         rect=opt.rect,
         rank=-1,
@@ -247,163 +247,158 @@ def train(hyp, opt, device, callbacks):
     scaler = torch.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)  # init loss class
-    callbacks.run("on_train_start")
-    LOGGER.info(
-        f'Image sizes {imgsz} train, {imgsz} val\n'
-        f'Using {train_loader.num_workers} dataloader workers\n'
-        f"Logging results to {colorstr('bold', save_dir)}\n"
-        f'Starting training for {epochs} epochs...'
-    )
-    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
-        callbacks.run("on_train_epoch_start")
-        model.train()
+    # callbacks.run("on_train_start")
+    # LOGGER.info(
+    #     f'Image sizes {imgsz} train, {imgsz} val\n'
+    #     f'Using {train_loader.num_workers} dataloader workers\n'
+    #     f"Logging results to {colorstr('bold', save_dir)}\n"
+    #     f'Starting training for {epochs} epochs...'
+    # )
+    # for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+    #     callbacks.run("on_train_epoch_start")
+    #     model.train()
 
-        mloss = torch.zeros(3, device=device)  # mean losses
-        pbar = enumerate(train_loader)
-        LOGGER.info(("\n" + "%11s" * 7) % ("Epoch", "GPU_mem", "box_loss", "obj_loss", "cls_loss", "Instances", "Size"))
+    #     mloss = torch.zeros(3, device=device)  # mean losses
+    #     pbar = enumerate(train_loader)
+    #     LOGGER.info(("\n" + "%11s" * 7) % ("Epoch", "GPU_mem", "box_loss", "obj_loss", "cls_loss", "Instances", "Size"))
 
-        pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
-        optimizer.zero_grad()
+    #     pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
+    #     optimizer.zero_grad()
 
-        for i, (imgs, targets, paths, _, _) in pbar:  # batch -------------------------------------------------------------
-            callbacks.run("on_train_batch_start")
-            ni = i + nb * epoch  # number integrated batches (since train start)
+    #     for i, (imgs, targets, paths, _, _) in pbar:  # batch -------------------------------------------------------------
+    #         callbacks.run("on_train_batch_start")
+    #         ni = i + nb * epoch  # number integrated batches (since train start)
 
-            if isinstance(imgs, list):
-                imgs = [img.to(device, non_blocking=True).float() / 255 for img in imgs]    # For RGB-T input
-            else:
-                imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+    #         if isinstance(imgs, list):
+    #             imgs = [img.to(device, non_blocking=True).float() / 255 for img in imgs]    # For RGB-T input
+    #         else:
+    #             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
-            # Warmup
-            if ni <= nw:
-                xi = [0, nw]  # x interp
-                accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
-                for j, x in enumerate(optimizer.param_groups):
-                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x["lr"] = np.interp(ni, xi, [hyp["warmup_bias_lr"] if j == 0 else 0.0, x["initial_lr"] * lf(epoch)])
-                    if "momentum" in x:
-                        x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
+    #         # Warmup
+    #         if ni <= nw:
+    #             xi = [0, nw]  # x interp
+    #             accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
+    #             for j, x in enumerate(optimizer.param_groups):
+    #                 # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+    #                 x["lr"] = np.interp(ni, xi, [hyp["warmup_bias_lr"] if j == 0 else 0.0, x["initial_lr"] * lf(epoch)])
+    #                 if "momentum" in x:
+    #                     x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
 
-            # Forward
-            with torch.amp.autocast(device_type=device.type):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if opt.quad:
-                    loss *= 4.0
+    #         # Forward
+    #         with torch.amp.autocast(device_type=device.type):
+    #             pred = model(imgs)  # forward
+    #             loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+    #             if opt.quad:
+    #                 loss *= 4.0
 
-            # Backward
-            scaler.scale(loss).backward()
+    #         # Backward
+    #         scaler.scale(loss).backward()
 
-            # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
-            if ni - last_opt_step >= accumulate:
-                scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
-                last_opt_step = ni
+    #         # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+    #         if ni - last_opt_step >= accumulate:
+    #             scaler.unscale_(optimizer)  # unscale gradients
+    #             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+    #             scaler.step(optimizer)  # optimizer.step
+    #             scaler.update()
+    #             optimizer.zero_grad()
+    #             if ema:
+    #                 ema.update(model)
+    #             last_opt_step = ni
 
-            # Log
-            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-            mem = f"{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
-            pbar.set_description(
-                ("%11s" * 2 + "%11.4g" * 5)
-                % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], (imgs[0] if isinstance(imgs, list) else imgs).shape[-1])
-            )
-            callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
-            if callbacks.stop_training:
-                return
-            # end batch ------------------------------------------------------------------------------------------------
+    #         # Log
+    #         mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+    #         mem = f"{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
+    #         pbar.set_description(
+    #             ("%11s" * 2 + "%11.4g" * 5)
+    #             % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], (imgs[0] if isinstance(imgs, list) else imgs).shape[-1])
+    #         )
+    #         callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
+    #         if callbacks.stop_training:
+    #             return
+    #         # end batch ------------------------------------------------------------------------------------------------
 
-        # Scheduler
-        lr = [x["lr"] for x in optimizer.param_groups]  # for loggers
-        scheduler.step()
+    #     # Scheduler
+    #     lr = [x["lr"] for x in optimizer.param_groups]  # for loggers
+    #     scheduler.step()
 
-        # mAP
-        callbacks.run("on_train_epoch_end", epoch=epoch)
-        ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
-        final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
-        if not noval or final_epoch:  # Calculate mAP
-            results, maps, _ = validate.run(
-                data_dict,
-                batch_size=batch_size * 2,
-                imgsz=imgsz,
-                half=amp,
-                model=ema.ema,
-                single_cls=single_cls,
-                save_json=True,
-                dataloader=val_loader,
-                save_dir=save_dir,
-                plots=True,
-                callbacks=callbacks,
-                compute_loss=compute_loss,
-                epoch=epoch,
-            )
+    #     # mAP
+    #     callbacks.run("on_train_epoch_end", epoch=epoch)
+    #     ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
+    #     final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
+    #     if not noval or final_epoch:  # Calculate mAP
+    #         results, maps, _ = validate.run(
+    #             data_dict,
+    #             batch_size=batch_size * 2,
+    #             imgsz=imgsz,
+    #             half=amp,
+    #             model=ema.ema,
+    #             single_cls=single_cls,
+    #             save_json=True,
+    #             dataloader=val_loader,
+    #             save_dir=save_dir,
+    #             plots=True,
+    #             callbacks=callbacks,
+    #             compute_loss=compute_loss,
+    #             epoch=epoch,
+    #         )
 
-        # Update best mAP
-        fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-        stop = stopper(epoch=epoch, fitness=fi)  # early stop check
-        if fi > best_fitness:
-            best_fitness = fi
-        log_vals = list(mloss) + list(results) + lr
-        callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
+    #     # Update best mAP
+    #     fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+    #     stop = stopper(epoch=epoch, fitness=fi)  # early stop check
+    #     if fi > best_fitness:
+    #         best_fitness = fi
+    #     log_vals = list(mloss) + list(results) + lr
+    #     callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
 
-        # Save model
-        if (not nosave) or (final_epoch):  # if save
-            ckpt = {
-                "epoch": epoch,
-                "best_fitness": best_fitness,
-                "model": deepcopy(de_parallel(model)).half(),
-                "ema": deepcopy(ema.ema).half(),
-                "updates": ema.updates,
-                "optimizer": optimizer.state_dict(),
-                "opt": vars(opt),
-                "date": datetime.now().isoformat(),
-            }
+    #     # Save model
+    #     if (not nosave) or (final_epoch):  # if save
+    #         ckpt = {
+    #             "epoch": epoch,
+    #             "best_fitness": best_fitness,
+    #             "model": deepcopy(de_parallel(model)).half(),
+    #             "ema": deepcopy(ema.ema).half(),
+    #             "updates": ema.updates,
+    #             "optimizer": optimizer.state_dict(),
+    #             "opt": vars(opt),
+    #             "date": datetime.now().isoformat(),
+    #         }
 
-            # Save last, best and delete
-            torch.save(ckpt, last)
-            if best_fitness == fi:
-                torch.save(ckpt, best)
-            if opt.save_period > 0 and epoch % opt.save_period == 0:
-                torch.save(ckpt, w / f"epoch{epoch}.pt")
-            del ckpt
-            callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
+    #         # Save last, best and delete
+    #         torch.save(ckpt, last)
+    #         if best_fitness == fi:
+    #             torch.save(ckpt, best)
+    #         if opt.save_period > 0 and epoch % opt.save_period == 0:
+    #             torch.save(ckpt, w / f"epoch{epoch}.pt")
+    #         del ckpt
+    #         callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
 
-        # EarlyStopping
-        if stop:
-            break
+    #     # EarlyStopping
+    #     if stop:
+    #         break
 
-        # end epoch ----------------------------------------------------------------------------------------------------
+    #     # end epoch ----------------------------------------------------------------------------------------------------
 
     # end training -----------------------------------------------------------------------------------------------------
-    LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
-    for f in last, best:
-        if f.exists():
-            strip_optimizer(f)  # strip optimizers
-            if f is best:
-                LOGGER.info(f"\nValidating {f}...")
-                results, _, _ = validate.run(
-                    data_dict,
-                    batch_size=batch_size * 2,
-                    imgsz=imgsz,
-                    model=attempt_load(f, device).half(),
-                    iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
-                    single_cls=single_cls,
-                    dataloader=val_loader,
-                    save_dir=save_dir,
-                    save_json=True,
-                    verbose=True,
-                    plots=False,
-                    callbacks=callbacks,
-                    compute_loss=compute_loss,
-                )  # val best model with plots
-                if is_coco:
-                    callbacks.run("on_fit_epoch_end", list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
-    callbacks.run("on_train_end", last, best, epoch, results)
+    best_model = weights
+    LOGGER.info(f"\nValidating {best_model}...")
+    results, _, _ = validate.run(
+        data_dict,
+        batch_size=batch_size * 2,
+        imgsz=imgsz,
+        task = "test",
+        model=attempt_load(best_model, device).half(),
+        iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
+        single_cls=single_cls,
+        dataloader=val_loader,
+        save_dir=save_dir,
+        save_json=True,
+        verbose=True,
+        plots=False,
+        callbacks=callbacks,
+        # compute_loss=compute_loss,
+    )  # val best model with plots
+                
 
     torch.cuda.empty_cache()
     return results
@@ -414,7 +409,7 @@ def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
     parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "datasets/kaist-rgbt/kfold_splits/yaml_configs/kaist-rgbt-fold1.yaml", help="dataset.yaml path")
+    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
@@ -438,7 +433,7 @@ def parse_opt(known=False):
     parser.add_argument("--single-cls", action="store_true", help="train multi-class data as single-class")
     parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam", "AdamW"], default="SGD", help="optimizer")
     parser.add_argument("--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode")
-    parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
+    parser.add_argument("--workers", type=int, default=16, help="max dataloader workers (per RANK in DDP mode)")
     parser.add_argument("--project", default=ROOT / "runs/train", help="save to project/name")
     parser.add_argument("--name", default="exp", help="save to project/name")
     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
@@ -450,7 +445,7 @@ def parse_opt(known=False):
     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
-    parser.add_argument("--rgbt", action="store_true", default=True, help="Feed RGB-T multispectral image pair.")
+    parser.add_argument("--rgbt", action="store_true", help="Feed RGB-T multispectral image pair.")
 
     # Logger arguments
     parser.add_argument("--entity", default=None, help="Entity")

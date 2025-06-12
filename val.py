@@ -127,7 +127,7 @@ def run(
     conf_thres=0.001,  # confidence threshold
     iou_thres=0.6,  # NMS IoU threshold
     max_det=300,  # maximum detections per image
-    task="val",  # train, val, test, speed or study
+    task="test",  # train, val, test, speed or study
     device="",  # cuda device, i.e. 0 or 0,1,2,3 or cpu
     workers=8,  # max dataloader workers (per RANK in DDP mode)
     single_cls=False,  # treat as single-class dataset
@@ -386,7 +386,7 @@ def parse_opt():
     parser.add_argument("--conf-thres", type=float, default=0.001, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.6, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=300, help="maximum detections per image")
-    parser.add_argument("--task", default="val", help="train, val, test, speed or study")
+    parser.add_argument("--task", default="test", help="train, val, test, speed or study")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
     parser.add_argument("--single-cls", action="store_true", help="treat as single-class dataset")

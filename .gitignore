@@ -39,6 +39,11 @@ data/images/*
 !data/*.sh
 
 results*.csv
+YOLOv5/
+test*/
+second/
+data/hyps/random_trials/
+*result*/
 
 YOLOv5/
 test/
