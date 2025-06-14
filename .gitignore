@@ -48,6 +48,7 @@ data/hyps/random_trials/
 YOLOv5/
 test/
 data/hyps/random_trials
+train_all/
 
 # Datasets -------------------------------------------------------------------------------------------------------------
 datasets/
