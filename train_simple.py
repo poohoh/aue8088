@@ -39,6 +39,7 @@ from models.yolo import Model
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
 from utils.downloads import attempt_download
+from utils.autoanchor import check_anchors
 from utils.general import (
     LOGGER,
     TQDM_BAR_FORMAT,
@@ -234,6 +235,10 @@ def train(hyp, opt, device, callbacks):
     if nc > 1:
         model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
+
+    # AutoAnchor 활성화
+    if not opt.noautoanchor:
+        check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
 
     # Start training
     t0 = time.time()
