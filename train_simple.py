@@ -62,7 +62,8 @@ from utils.general import (
     yaml_save,
 )
 from utils.loggers import Loggers
-from utils.loss import ComputeLoss
+# from utils.loss import ComputeLoss
+from utils.loss import ComputeCustomLoss
 from utils.metrics import fitness
 from utils.torch_utils import (
     EarlyStopping,
@@ -251,7 +252,8 @@ def train(hyp, opt, device, callbacks):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
+    # compute_loss = ComputeLoss(model)  # init loss class
+    compute_loss = ComputeCustomLoss(model)  # init loss class
     callbacks.run("on_train_start")
     LOGGER.info(
         f'Image sizes {imgsz} train, {imgsz} val\n'
@@ -374,6 +376,9 @@ def train(hyp, opt, device, callbacks):
                 torch.save(ckpt, best)
             if opt.save_period > 0 and epoch % opt.save_period == 0:
                 torch.save(ckpt, w / f"epoch{epoch}.pt")
+            # Save every 50 epochs
+            if epoch % 50 == 0:
+                torch.save(ckpt, w / f"epoch_{epoch}.pt")
             del ckpt
             callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
 
