@@ -1084,6 +1084,14 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         }
     }
 
+    # label mapping
+    label_mapping = {
+        0: 0,  # person -> person
+        1: 1,  # cyclist -> cyclist
+        2: 2,  # people -> person
+        3: 0,  # person? -> person
+    }
+
     def __init__(self, path, **kwargs):
         # HACK: cannot guarantee that path contain split name
         is_train = 'train' in path
@@ -1096,25 +1104,35 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         super().__init__(path, **kwargs)
 
-        print(self.mosaic)
+        self.mosaic = self.augment and not self.rect
+        print(f'self.mosaic: {self.mosaic}')
 
         # Set ignore flag
         cond = self.ignore_settings['train' if is_train else 'test']
         for i in range(len(self.labels)):
-            if single_cls:  # single-class training, merge all classes into 0
-                self.labels[i][self.labels[i][:, 0] != 0, 0] = -1   # ignore cyclist / people / person
-
             if len(self.labels[i]):
+                # apply label mapping
+                for j in range(len(self.labels[i])):
+                    original_class = int(self.labels[i][j, 0])
+                    if original_class in self.label_mapping:
+                        self.labels[i][j, 0] = self.label_mapping[original_class]
+
+                people_idx = self.labels[i][:, 0] == 2  # people
+                self.labels[i][people_idx, 0] = -2  # -2 indicates people class
+
+                if single_cls:  # single-class training, merge all classes into 0
+                    self.labels[i][self.labels[i][:, 0] != 0, 0] = -1   # ignore cyclist / people / person?
+
                 x1, y1, w, h = self.labels[i][:,1:5].T
                 x2 = x1 + w
                 y2 = y1 + h
-                ignore_idx = (x1 < cond['xRng'][0]) & \
-                            (x2 > cond['xRng'][1]) & \
-                            (y1 < cond['yRng'][0]) & \
-                            (y2 > cond['yRng'][1]) & \
-                            (w < cond['wRng'][0]) & \
-                            (w > cond['wRng'][1]) & \
-                            (h < cond['hRng'][0]) & \
+                ignore_idx = (x1 < cond['xRng'][0]) | \
+                            (x2 > cond['xRng'][1]) | \
+                            (y1 < cond['yRng'][0]) | \
+                            (y2 > cond['yRng'][1]) | \
+                            (w < cond['wRng'][0]) | \
+                            (w > cond['wRng'][1]) | \
+                            (h < cond['hRng'][0]) | \
                             (h > cond['hRng'][1])
                 self.labels[i][ignore_idx, 0] = -1
 
