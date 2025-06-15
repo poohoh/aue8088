@@ -1117,11 +1117,8 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                     if original_class in self.label_mapping:
                         self.labels[i][j, 0] = self.label_mapping[original_class]
 
-                people_idx = self.labels[i][:, 0] == 2  # people
-                self.labels[i][people_idx, 0] = -2  # -2 indicates people class
-
                 if single_cls:  # single-class training, merge all classes into 0
-                    self.labels[i][self.labels[i][:, 0] != 0, 0] = -1   # ignore cyclist / people / person?
+                    self.labels[i][self.labels[i][:, 0] != 0, 0] = -1   # ignore cyclist / people / person
 
                 x1, y1, w, h = self.labels[i][:,1:5].T
                 x2 = x1 + w

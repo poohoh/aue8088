@@ -10,7 +10,17 @@ from utils.torch_utils import de_parallel
 
 
 def smooth_BCE(eps=0.1):
-    """Returns label smoothing BCE targets for reducing overfitting; pos: `1.0 - 0.5*eps`, neg: `0.5*eps`. For details see https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441"""
+    """Returns label smoothing BCE targets for reducing overfitting; pos: `1.0 - 0.5*eps`, neg: `0.5*eps`.            # ❷ BCE obj — IGNORE 셀 제외
+            valid = tobj != self.IGNORE_VAL
+            if valid.any():                              # 빈 마스크 방지
+                obji = self.BCEobj(pi[..., 4][valid], tobj[valid])
+                lobj += obji.mean() * self.balance[i]
+                if self.autobalance:
+                    self.balance[i] = (
+                        self.balance[i] * 0.9999 + 0.0001 / obji.mean().item()
+                    )
+            else:                                        # valid가 없을 때
+                obji = torch.tensor(0.0, device=self.device)etails see https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441"""
     return 1.0 - 0.5 * eps, 0.5 * eps
 
 
@@ -264,7 +274,6 @@ class ComputeLoss:
 class ComputeCustomLoss:
     sort_obj_iou = False
 
-    # Compute losses
     def __init__(self, model, autobalance=False):
         """Initializes ComputeLoss with model and autobalance option, autobalances losses if True."""
         device = next(model.parameters()).device  # get model device
@@ -291,6 +300,7 @@ class ComputeCustomLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
+        self.people_class_id = 2  # people class ID
 
     def __call__(self, p, targets):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
@@ -307,7 +317,6 @@ class ComputeCustomLoss:
             n = b.shape[0]  # number of targets
             if n:
                 pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
-                # pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
 
                 # Regression
                 pxy = pxy.sigmoid() * 2 - 0.5
@@ -323,53 +332,64 @@ class ComputeCustomLoss:
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
                 if self.gr < 1:
                     iou = (1.0 - self.gr) + self.gr * iou
-                
-                # process people boxes
-                if hasattr(self, 'people_boxes') and len(self.people_boxes) > 0:
-                    # transform people boxes to original image coordinates
-                    pred_boxes = pbox.clone()
-                    pred_boxes[:, 0] = (pred_boxes[:, 0] + gi) / pi.shape[3]  # x
-                    pred_boxes[:, 1] = (pred_boxes[:, 1] + gj) / pi.shape[2]  # y
-                    pred_boxes[:, 2] = pred_boxes[:, 2] / pi.shape[3]  # w
-                    pred_boxes[:, 3] = pred_boxes[:, 3] / pi.shape[2]  # h
-
-                    # calculate iou with people boxes
-                    people_boxes_norm = self.people_boxes[self.people_boxes[:, 0] == b[0].float()]
-                    if len(people_boxes_norm) > 0:
-                        people_xyxy = xywh2xyxy(people_boxes_norm[:, 2:6])
-                        pred_xyxy = xywh2xyxy(pred_boxes)
-                        
-                        # people 박스 내부에 있는 예측 찾기
-                        iou_with_people = box_iou(pred_xyxy, people_xyxy)
-                        inside_people = (iou_with_people.max(dim=1)[0] > 0.5)
-                        
-                        # people 내부의 person 예측은 ignore
-                        valid_idx = ~inside_people | (tcls[i] != 0)  # person이 아니거나 people 외부
-                        b, a, gj, gi, iou = b[valid_idx], a[valid_idx], gj[valid_idx], gi[valid_idx], iou[valid_idx]
-                        if tcls[i].shape[0] > 0:
-                            tcls[i] = tcls[i][valid_idx]
-                            tbox[i] = tbox[i][valid_idx]
 
                 tobj[b, a, gj, gi] = iou  # iou ratio
-
-                # # If prediction is matched (iou > 0.5) with bounding box marked as ignore,
-                # # do not calculate objectness loss
-                # ign_idx = (tcls[i] == -1) & (iou > self.hyp["iou_t"])
-                # keep = ~ign_idx
-                # b, a, gj, gi, iou = b[keep], a[keep], gj[keep], gi[keep], iou[keep]
-
-                # tobj[b, a, gj, gi] = iou  # iou ratio
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets
-                    if len(tcls[i]) > 0:
-                        t[range(len(tcls[i])), tcls[i]] = self.cp
+                    t[range(n), tcls[i]] = self.cp
                     lcls += self.BCEcls(pcls, t)  # BCE
 
-                # Append targets to text file
-                # with open('targets.txt', 'a') as file:
-                #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
+            # People box inside person prediction objectness adjustment
+            if hasattr(self, 'people_boxes_per_image') and len(self.people_boxes_per_image) > 0:
+                for batch_idx in range(pi.shape[0]):
+                    if batch_idx in self.people_boxes_per_image:
+                        people_boxes = self.people_boxes_per_image[batch_idx]
+                        if len(people_boxes) > 0:
+                            # Get current layer predictions
+                            pred_obj = pi[batch_idx, ..., 4]  # Objectness prediction
+                            pred_cls = pi[batch_idx, ..., 5:].sigmoid()  # Class prediction
+
+                            # Person class prediction mask (assuming person class index = 0)
+                            person_pred_mask = pred_cls[..., 0] > 0.5
+
+                            for people_box in people_boxes:
+                                people_box = people_box.to(self.device)
+                                x, y, w, h = people_box
+                                
+                                # Convert to grid coordinates
+                                grid_x1 = int((x - w / 2) * pi.shape[3])
+                                grid_y1 = int((y - h / 2) * pi.shape[2])
+                                grid_x2 = int((x + w / 2) * pi.shape[3])
+                                grid_y2 = int((y + h / 2) * pi.shape[2])
+                                
+                                # Clamp boundaries
+                                grid_x1 = max(0, grid_x1)
+                                grid_y1 = max(0, grid_y1)
+                                grid_x2 = min(pi.shape[3] - 1, grid_x2)
+                                grid_y2 = min(pi.shape[2] - 1, grid_y2)
+
+                                if grid_x1 >= grid_x2 or grid_y1 >= grid_y2:
+                                    continue
+
+                                # Create mask (Anchor, Y, X)
+                                # Use unsqueeze(0) for broadcasting to anchor dimension
+                                final_mask = torch.zeros_like(pred_obj, dtype=torch.bool)
+                                final_mask[:, grid_y1:grid_y2+1, grid_x1:grid_x2+1] = person_pred_mask[:, grid_y1:grid_y2+1, grid_x1:grid_x2+1]
+
+                                # Positive sample protection logic
+                                # Apply ignore mask only to background positions (where tobj is 0)
+                                background_mask = tobj[batch_idx] == 0
+                                final_mask = final_mask & background_mask
+
+                                # Set target to current prediction for 'ignore' processing
+                                # Use .detach() to prevent gradient flow
+                                tobj[batch_idx] = torch.where(
+                                    final_mask,
+                                    pred_obj.detach(), # target = prediction -> loss = 0
+                                    tobj[batch_idx]
+                                )
 
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[i]  # obj loss
@@ -387,25 +407,23 @@ class ComputeCustomLoss:
 
     def build_targets(self, p, targets):
         """Prepares model targets from input targets (image,class,x,y,w,h) for loss computation, returning class, box,
-        indices, and anchors.
-        """
+        indices, and anchors. Also stores people boxes for later reference."""
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
         tcls, tbox, indices, anch = [], [], [], []
         gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
-        ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-        # targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
-
-        people_boxes = targets[targets[:, 1] == -2].clone()  # save people boxes
-
-        # ignore people boxes
-        valid_targets = targets[targets[:, 1] >= 0]
-
-        if valid_targets.shape[0] == 0:
-            return tcls, tbox, indices, anch
         
-        nt = valid_targets.shape[0]  # update number of targets
+        # Store people group boxes per image
+        self.people_boxes_per_image = {}
+        for t in targets:
+            img_idx = int(t[0].item())
+            if t[1] == self.people_class_id:  # people class
+                if img_idx not in self.people_boxes_per_image:
+                    self.people_boxes_per_image[img_idx] = []
+                self.people_boxes_per_image[img_idx].append(t[2:6])  # store xywh
+        
+        # Process all targets (including people)
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-        valid_targets = torch.cat((valid_targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
+        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
 
         g = 0.5  # bias
         off = (
@@ -416,7 +434,6 @@ class ComputeCustomLoss:
                     [0, 1],
                     [-1, 0],
                     [0, -1],  # j,k,l,m
-                    # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                 ],
                 device=self.device,
             ).float()
@@ -428,12 +445,11 @@ class ComputeCustomLoss:
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
 
             # Match targets to anchors
-            t = valid_targets * gain  # shape(3,n,7)
+            t = targets * gain  # shape(3,n,7)
             if nt:
                 # Matches
                 r = t[..., 4:6] / anchors[:, None]  # wh ratio
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp["anchor_t"]  # compare
-                # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
                 t = t[j]  # filter
 
                 # Offsets
@@ -445,7 +461,7 @@ class ComputeCustomLoss:
                 t = t.repeat((5, 1, 1))[j]
                 offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
             else:
-                t = valid_targets[0]
+                t = targets[0]
                 offsets = 0
 
             # Define
@@ -459,7 +475,5 @@ class ComputeCustomLoss:
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
-
-        self.people_boxes = people_boxes
 
         return tcls, tbox, indices, anch
