@@ -1,0 +1,76 @@
+# YOLOv5x6 RGB-T with Minimal Attention (CBAM + CrossAttention)
+# models/custom/yolov5x6_kaist-rgbt-minimal-attention-final.yaml
+
+# Parameters
+nc: 4  # number of classes
+depth_multiple: 1.33  # model depth multiple
+width_multiple: 1.25  # layer channel multiple
+anchors:
+  - [19, 27, 44, 40, 38, 94]  # P3/8
+  - [96, 68, 86, 152, 180, 137]  # P4/16
+  - [140, 301, 303, 264, 238, 542]  # P5/32
+  - [436, 615, 739, 380, 925, 792]  # P6/64
+
+# YOLOv5 v6.0 backbone
+backbone:
+  # [from, number, module, args]
+  [
+    # --- Dual-stream (변경이 일어나는 부분) ---
+    [-1, 1, MultiStreamConv, [64, 6, 2, 2]],      # 0. P1/2
+    [-1, 1, MultiStreamCBAM, [64]],               # 1. 경량 어텐션
+    
+    [-1, 1, MultiStreamConv, [128, 3, 2]],      # 2. P2/4
+    [-1, 9, MultiStreamC3, [128]],                # 3. (x6 모델에 맞는 깊이)
+    
+    [-1, 1, DualStreamCrossAttention, [8]],       # 4. ◀◀◀ (수정) num_heads를 8로 설정 (128은 오류)
+    
+    # --- Fusion 및 Single-stream (기존 v5x6 구조와 완전히 동일) ---
+    [-1, 1, Fusion, ['concat', 2]],             # 5.
+    [-1, 1, Conv, [256, 1, 1]],                 # 6.
+    
+    [-1, 1, Conv, [512, 3, 2]],                 # 7. P3/8
+    [-1, 9, C3, [512]],                         # 8.
+    
+    [-1, 1, Conv, [768, 3, 2]],                 # 9. P4/16
+    [-1, 9, C3, [768]],                         # 10.
+    
+    [-1, 1, Conv, [1024, 3, 2]],                # 11. P5/32
+    [-1, 3, C3, [1024]],                        # 12.
+    
+    [-1, 1, Conv, [1024, 3, 2]],                # 13. P6/64
+    [-1, 3, C3, [1024]],                        # 14.
+    
+    [-1, 1, SPPF, [1024, 5]],                   # 15.
+  ]
+
+# YOLOv5 v6.0 head
+head: [
+    [-1, 1, Conv, [768, 1, 1]],                 # 16.
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]], # 17.
+    [[-1, 12], 1, Concat, [1]],                 # 18. cat backbone P5
+    [-1, 3, C3, [768, False]],                  # 19.
+
+    [-1, 1, Conv, [512, 1, 1]],                 # 20.
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]], # 21.
+    [[-1, 10], 1, Concat, [1]],                 # 22. cat backbone P4
+    [-1, 3, C3, [512, False]],                  # 23.
+
+    [-1, 1, Conv, [256, 1, 1]],                 # 24.
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]], # 25.
+    [[-1, 8], 1, Concat, [1]],                  # 26. cat backbone P3
+    [-1, 3, C3, [256, False]],                  # 27. (P3/8-small)
+
+    [-1, 1, Conv, [256, 3, 2]],                 # 28.
+    [[-1, 23], 1, Concat, [1]],                 # 29. cat head P4
+    [-1, 3, C3, [512, False]],                  # 30. (P4/16-medium)
+
+    [-1, 1, Conv, [512, 3, 2]],                 # 31.
+    [[-1, 19], 1, Concat, [1]],                 # 32. cat head P5
+    [-1, 3, C3, [768, False]],                  # 33. (P5/32-large)
+
+    [-1, 1, Conv, [768, 3, 2]],                 # 34.
+    [[-1, 16], 1, Concat, [1]],                 # 35. cat head P6
+    [-1, 3, C3, [1024, False]],                 # 36. (P6/64-xlarge)
+
+    [[27, 30, 33, 36], 1, Detect, [nc, anchors]],  # Detect(P3, P4, P5, P6)
+  ]
