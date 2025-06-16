@@ -51,6 +51,7 @@ data/hyps/random_trials
 train_all/
 val/
 *.md
+train_final/
 
 # Datasets -------------------------------------------------------------------------------------------------------------
 datasets/

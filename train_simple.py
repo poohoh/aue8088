@@ -132,7 +132,7 @@ def train(hyp, opt, device, callbacks):
     data_dict = loggers.remote_dataset
 
     # Config
-    init_seeds(opt.seed, deterministic=True)
+    init_seeds(opt.seed, deterministic=False)
     data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path = data_dict["train"], data_dict["val"]
     nc = 1 if single_cls else int(data_dict["nc"])  # number of classes
@@ -425,7 +425,7 @@ def parse_opt(known=False):
     parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
     parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
     parser.add_argument("--data", type=str, default=ROOT / "datasets/kaist-rgbt/kfold_splits/yaml_configs/kaist-rgbt-fold1.yaml", help="dataset.yaml path")
-    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
+    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-high.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")

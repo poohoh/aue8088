@@ -51,6 +51,8 @@ from models.common import (
     MultiStreamConv,
     MultiStreamC3,
     MultiStreamMaxPool2d,
+    MultiStreamCBAM,
+    DualStreamCrossAttention,
     Fusion,
 )
 from models.experimental import MixConv2d
@@ -314,6 +316,12 @@ class DetectionModel(BaseModel):
 
 Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
 
+
+def _scalar(x):
+    """Returns the scalar value of a tensor or a list/tuple's first element."""
+    return x[0] if isinstance(x, (list, tuple)) else x
+
+
 def parse_model(d, ch):
     """Parses a YOLOv5 model from a dict `d`, configuring layers based on input channels `ch` and model architecture."""
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
@@ -333,7 +341,7 @@ def parse_model(d, ch):
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    layers, save, c2 = [], [], _scalar(ch[-1])  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
@@ -341,53 +349,66 @@ def parse_model(d, ch):
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
+        
+        # =================================================================
+        # 1. General Conv and custom module processing block
+        # =================================================================
         if m in {
-            Conv,
-            GhostConv,
-            Bottleneck,
-            GhostBottleneck,
-            SPP,
-            SPPF,
-            DWConv,
-            MixConv2d,
-            Focus,
-            CrossConv,
-            BottleneckCSP,
-            C3,
-            C3TR,
-            C3SPP,
-            C3Ghost,
-            nn.ConvTranspose2d,
-            DWConvTranspose2d,
-            C3x,
-            MultiStreamConv,
-            MultiStreamC3,
+            Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv,
+            MixConv2d, Focus, CrossConv, BottleneckCSP, C3, C3TR, C3SPP,
+            C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x,
+            MultiStreamConv, MultiStreamC3,
         }:
-            c1, c2 = ch[f], args[0]
-            if c2 != no:  # if not output
+            c1, c2 = _scalar(ch[f]), args[0]
+            if c2 != no:
                 c2 = make_divisible(c2 * gw, ch_mul)
-
             args = [c1, c2, *args[1:]]
             if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, MultiStreamC3}:
-                args.insert(2, n)  # number of repeats
+                args.insert(2, n)
                 n = 1
+        
+        elif m is MultiStreamCBAM:
+            c1 = _scalar(ch[f])
+            c2 = c1
+            args = [c1, *args] 
+        
+        elif m is DualStreamCrossAttention:
+            c1 = _scalar(ch[f])
+            c2 = c1
+            args = [c1, *args]
+
         elif m is nn.BatchNorm2d:
-            args = [ch[f]]
+            args = [_scalar(ch[f])]
+
         elif m is Concat:
-            c2 = sum(ch[x] for x in f)
-        # TODO: channel, gw, gd
-        elif m in {Detect,}:
-            args.append([ch[x] for x in f])
-            if isinstance(args[1], int):  # number of anchors
-                args[1] = [list(range(args[1] * 2))] * len(f)
-        elif m is Contract:
-            c2 = ch[f] * args[0] ** 2
-        elif m is Expand:
-            c2 = ch[f] // args[0] ** 2
+            c2 = sum(_scalar(ch[x]) for x in f)
+
         elif m is Fusion:
-            c2 = ch[f] * args[1]
+            base_c = _scalar(ch[f])
+            if args[0] == 'concat':
+                c2 = base_c * args[1]
+            else:
+                c2 = base_c
+        
+        # =================================================================
+        # 2. Detect, Contract, Expand special module processing block
+        # =================================================================
+        elif m is Detect:
+            args.append([_scalar(ch[x]) for x in f])
+            if isinstance(args[1], int):
+                args[1] = [list(range(args[1] * 2))] * len(f)
+        
+        elif m is Contract:
+            c2 = _scalar(ch[f]) * args[0] ** 2
+            
+        elif m is Expand:
+            c2 = _scalar(ch[f]) // args[0] ** 2
+            
+        # =================================================================
+        # 3. Default processing for all other modules
+        # =================================================================
         else:
-            c2 = ch[f]
+            c2 = _scalar(ch[f])
 
         m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
@@ -398,7 +419,11 @@ def parse_model(d, ch):
         layers.append(m_)
         if i == 0:
             ch = []
-        ch.append(c2)
+        
+        if m in {MultiStreamConv, MultiStreamC3, MultiStreamCBAM, DualStreamCrossAttention}:
+            ch.append([c2, c2])
+        else:
+            ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
 
 

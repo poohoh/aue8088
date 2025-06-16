@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from torch.cuda import amp
 
@@ -493,11 +494,12 @@ class MultiStreamSelfAttention(nn.Module):
 
 
 class CrossModalAttention(nn.Module):
-    """Cross-Modal Attention for RGB-T fusion"""
-    def __init__(self, c1, num_heads=8, dropout=0.1):
+    """Window-based Cross-Modal Attention for RGB-T fusion to reduce memory usage"""
+    def __init__(self, c1, num_heads=8, window_size=8, dropout=0.1):
         super().__init__()
         self.c1 = c1
         self.num_heads = num_heads
+        self.window_size = window_size
         self.head_dim = c1 // num_heads
         assert self.head_dim * num_heads == c1, "c1 must be divisible by num_heads"
         
@@ -508,30 +510,82 @@ class CrossModalAttention(nn.Module):
         self.proj = nn.Linear(c1, c1)
         self.dropout = nn.Dropout(dropout)
         
+    def window_partition(self, x):
+        """
+        Partition feature map into windows
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            windows: (num_windows*B, window_size*window_size, C)
+        """
+        B, C, H, W = x.shape
+        
+        # Pad if necessary
+        pad_h = (self.window_size - H % self.window_size) % self.window_size
+        pad_w = (self.window_size - W % self.window_size) % self.window_size
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
+        
+        Hp, Wp = H + pad_h, W + pad_w
+        
+        # Reshape to windows
+        x = x.view(B, C, Hp // self.window_size, self.window_size, Wp // self.window_size, self.window_size)
+        windows = x.permute(0, 2, 4, 3, 5, 1).contiguous().view(-1, self.window_size * self.window_size, C)
+        
+        return windows, (Hp, Wp, H, W)
+    
+    def window_reverse(self, windows, window_info, B):
+        """
+        Reverse window partition
+        Args:
+            windows: (num_windows*B, window_size*window_size, C)
+            window_info: (Hp, Wp, H, W)
+            B: batch size
+        Returns:
+            x: (B, C, H, W)
+        """
+        Hp, Wp, H, W = window_info
+        C = windows.shape[-1]
+        
+        x = windows.view(B, Hp // self.window_size, Wp // self.window_size, self.window_size, self.window_size, C)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous().view(B, C, Hp, Wp)
+        
+        # Remove padding if applied
+        if Hp > H or Wp > W:
+            x = x[:, :, :H, :W]
+        
+        return x
+        
     def forward(self, x1, x2):
         """x1: query features, x2: key/value features"""
-        b, c, h, w = x1.shape
-        x1_flat = x1.flatten(2).transpose(1, 2)  # (B, H*W, C)
-        x2_flat = x2.flatten(2).transpose(1, 2)
-        b, n, c = x1_flat.shape
+        B, C, H, W = x1.shape
+        
+        # Apply window partition
+        x1_windows, window_info = self.window_partition(x1)
+        x2_windows, _ = self.window_partition(x2)
+        
+        # Window attention
+        B_win, N, C = x1_windows.shape
         
         # Generate Q from x1, K and V from x2
-        q = self.q_proj(x1_flat).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x2_flat).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x2_flat).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x1_windows).reshape(B_win, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x2_windows).reshape(B_win, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x2_windows).reshape(B_win, N, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Cross attention
+        # Cross attention within windows
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
         
         # Apply attention to values
-        out = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        out = (attn @ v).transpose(1, 2).reshape(B_win, N, C)
         out = self.proj(out)
         out = self.dropout(out)
         
-        # Reshape back and add residual
-        out = out.transpose(1, 2).reshape(b, c, h, w)
+        # Reverse window partition
+        out = self.window_reverse(out, window_info, B)
+        
+        # Add residual connection
         return x1 + out
 
 
@@ -598,11 +652,12 @@ class MultiStreamC3Attention(nn.Module):
 
 
 class DualStreamCrossAttention(nn.Module):
-    """Dual-stream cross attention module for RGB-T fusion"""
-    def __init__(self, c1, num_heads=8):
+    """Dual-stream cross attention module for RGB-T fusion using window-based attention"""
+    def __init__(self, c1, num_heads=8, window_size=8):
         super().__init__()
-        self.cross_attn_rgb = CrossModalAttention(c1, num_heads)
-        self.cross_attn_thermal = CrossModalAttention(c1, num_heads)
+        # Use window-based cross attention to reduce memory usage
+        self.cross_attn_rgb = CrossModalAttention(c1, num_heads, window_size)
+        self.cross_attn_thermal = CrossModalAttention(c1, num_heads, window_size)
         
     def forward(self, x):
         """x should be a list [rgb_features, thermal_features]"""
