@@ -376,8 +376,8 @@ def train(hyp, opt, device, callbacks):
                 torch.save(ckpt, best)
             if opt.save_period > 0 and epoch % opt.save_period == 0:
                 torch.save(ckpt, w / f"epoch{epoch}.pt")
-            # Save every 50 epochs
-            if epoch % 50 == 0:
+            # Save every 1 epochs
+            if epoch % 10 == 0:
                 torch.save(ckpt, w / f"epoch_{epoch}.pt")
             del ckpt
             callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
