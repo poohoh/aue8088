@@ -316,6 +316,221 @@ class C3Ghost(C3):
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*(GhostBottleneck(c_, c_) for _ in range(n)))
 
+class MultiStreamC3TR(nn.Module):
+    # Multi-stream C3 module with TransformerBlock for each stream
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, num_streams=2):
+        """Initializes Multi-stream C3 module with TransformerBlock for enhanced feature extraction in each stream."""
+        super().__init__()
+        self.c3tr_layers = nn.ModuleList([C3TR(c1, c2, n, shortcut, g, e) for _ in range(num_streams)])
+
+    def forward(self, x):
+        """Performs forward propagation using C3TR layers for each input stream."""
+        assert len(x) == len(self.c3tr_layers), 'The number of input data stream does not match the predefined settings.'
+        return [_layer(_x) for _x, _layer in zip(x, self.c3tr_layers)]
+
+
+class CrossAttentionFusion(nn.Module):
+    # Cross-attention fusion module for multi-stream features
+    def __init__(self, c, num_heads=4):
+        """Initializes Cross-attention fusion module for fusing features between different streams."""
+        super().__init__()
+        self.num_heads = num_heads
+        self.q = nn.Linear(c, c, bias=False)
+        self.k = nn.Linear(c, c, bias=False) 
+        self.v = nn.Linear(c, c, bias=False)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=c, num_heads=num_heads)
+        self.norm = nn.LayerNorm(c)
+        self.conv_out = Conv(c * 2, c, 1, 1)  # 융합 후 채널 조정
+
+    def forward(self, x):
+        """Performs cross-attention fusion between RGB and Thermal features."""
+        # x는 [rgb_features, thermal_features] 형태
+        rgb_feat, thermal_feat = x[0], x[1]
+        
+        # Feature map을 sequence로 변환
+        b, c, h, w = rgb_feat.shape
+        rgb_seq = rgb_feat.flatten(2).permute(2, 0, 1)  # (H*W, B, C)
+        thermal_seq = thermal_feat.flatten(2).permute(2, 0, 1)
+        
+        # RGB -> Thermal Cross-Attention
+        rgb_q = self.q(rgb_seq)
+        thermal_k, thermal_v = self.k(thermal_seq), self.v(thermal_seq)
+        rgb_enhanced = self.cross_attn(rgb_q, thermal_k, thermal_v)[0] + rgb_seq
+        
+        # Thermal -> RGB Cross-Attention  
+        thermal_q = self.q(thermal_seq)
+        rgb_k, rgb_v = self.k(rgb_seq), self.v(rgb_seq)
+        thermal_enhanced = self.cross_attn(thermal_q, rgb_k, rgb_v)[0] + thermal_seq
+        
+        # 다시 feature map 형태로 변환
+        rgb_enhanced = rgb_enhanced.permute(1, 2, 0).reshape(b, c, h, w)
+        thermal_enhanced = thermal_enhanced.permute(1, 2, 0).reshape(b, c, h, w)
+        
+        # 융합
+        fused = torch.cat([rgb_enhanced, thermal_enhanced], dim=1)
+        return self.conv_out(fused)
+
+class MultiHeadSelfAttention(nn.Module):
+    """Multi-Head Self-Attention module for feature enhancement"""
+    def __init__(self, c1, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.c1 = c1
+        self.num_heads = num_heads
+        self.head_dim = c1 // num_heads
+        assert self.head_dim * num_heads == c1, "c1 must be divisible by num_heads"
+        
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(c1, c1 * 3)
+        self.proj = nn.Linear(c1, c1)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, H*W, C)
+        b, n, c = x.shape
+        
+        # Generate Q, K, V
+        qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        # Attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        # Apply attention to values
+        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        x = self.proj(x)
+        x = self.dropout(x)
+        
+        # Reshape back to (B, C, H, W)
+        x = x.transpose(1, 2).reshape(b, c, h, w)
+        return x
+
+
+class CrossModalAttention(nn.Module):
+    """Cross-Modal Attention for RGB-T fusion"""
+    def __init__(self, c1, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.c1 = c1
+        self.num_heads = num_heads
+        self.head_dim = c1 // num_heads
+        assert self.head_dim * num_heads == c1, "c1 must be divisible by num_heads"
+        
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Linear(c1, c1)
+        self.k_proj = nn.Linear(c1, c1)
+        self.v_proj = nn.Linear(c1, c1)
+        self.proj = nn.Linear(c1, c1)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x1, x2):
+        """x1: query features, x2: key/value features"""
+        b, c, h, w = x1.shape
+        x1_flat = x1.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        x2_flat = x2.flatten(2).transpose(1, 2)
+        b, n, c = x1_flat.shape
+        
+        # Generate Q from x1, K and V from x2
+        q = self.q_proj(x1_flat).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x2_flat).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x2_flat).reshape(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Cross attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        # Apply attention to values
+        out = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        out = self.proj(out)
+        out = self.dropout(out)
+        
+        # Reshape back and add residual
+        out = out.transpose(1, 2).reshape(b, c, h, w)
+        return x1 + out
+
+
+class MultiStreamC3Attention(nn.Module):
+    """C3 module with self-attention for multi-stream processing"""
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        # For multi-stream, we process each stream separately
+        c_ = int(c2 * e)
+        self.is_multistream = True
+        
+        # Separate paths for RGB and Thermal
+        self.cv1_rgb = Conv(c1, c_, 1, 1)
+        self.cv1_thermal = Conv(c1, c_, 1, 1)
+        self.cv2_rgb = Conv(c1, c_, 1, 1)
+        self.cv2_thermal = Conv(c1, c_, 1, 1)
+        
+        # Bottleneck layers for each stream
+        self.m_rgb = nn.ModuleList([Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        self.m_thermal = nn.ModuleList([Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        
+        # Fusion convolutions
+        self.cv3_rgb = Conv(2 * c_, c2, 1)
+        self.cv3_thermal = Conv(2 * c_, c2, 1)
+        
+        # Self-attention for each stream
+        self.attn_rgb = MultiHeadSelfAttention(c2)
+        self.attn_thermal = MultiHeadSelfAttention(c2)
+        
+    def forward(self, x):
+        if isinstance(x, list) and len(x) == 2:
+            rgb, thermal = x
+            
+            # Process RGB stream
+            x1_rgb = self.cv1_rgb(rgb)
+            x2_rgb = self.cv2_rgb(rgb)
+            x3_rgb = x1_rgb
+            for m in self.m_rgb:
+                x3_rgb = m(x3_rgb)
+            out_rgb = self.cv3_rgb(torch.cat((x3_rgb, x2_rgb), dim=1))
+            out_rgb = self.attn_rgb(out_rgb)
+            
+            # Process Thermal stream
+            x1_thermal = self.cv1_thermal(thermal)
+            x2_thermal = self.cv2_thermal(thermal)
+            x3_thermal = x1_thermal
+            for m in self.m_thermal:
+                x3_thermal = m(x3_thermal)
+            out_thermal = self.cv3_thermal(torch.cat((x3_thermal, x2_thermal), dim=1))
+            out_thermal = self.attn_thermal(out_thermal)
+            
+            return [out_rgb, out_thermal]
+        else:
+            # Single stream processing
+            c_ = int(self.cv3_rgb.conv.out_channels * 0.5)
+            x1 = self.cv1_rgb(x)
+            x2 = self.cv2_rgb(x)
+            x3 = x1
+            for m in self.m_rgb:
+                x3 = m(x3)
+            out = self.cv3_rgb(torch.cat((x3, x2), dim=1))
+            out = self.attn_rgb(out)
+            return out
+
+
+class DualStreamCrossAttention(nn.Module):
+    """Dual-stream cross attention module for RGB-T fusion"""
+    def __init__(self, c1, num_heads=8):
+        super().__init__()
+        self.cross_attn_rgb = CrossModalAttention(c1, num_heads)
+        self.cross_attn_thermal = CrossModalAttention(c1, num_heads)
+        
+    def forward(self, x):
+        """x should be a list [rgb_features, thermal_features]"""
+        if isinstance(x, list) and len(x) == 2:
+            rgb, thermal = x
+            # RGB attends to thermal
+            rgb_enhanced = self.cross_attn_rgb(rgb, thermal)
+            # Thermal attends to RGB
+            thermal_enhanced = self.cross_attn_thermal(thermal, rgb)
+            return [rgb_enhanced, thermal_enhanced]
+        else:
+            raise ValueError("DualStreamCrossAttention expects a list of two tensors")
 
 class SPP(nn.Module):
     # Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729
