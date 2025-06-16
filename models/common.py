@@ -316,6 +316,72 @@ class C3Ghost(C3):
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*(GhostBottleneck(c_, c_) for _ in range(n)))
 
+class ChannelAttention(nn.Module):
+    """Channel attention module for CBAM"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    """Spatial attention module for CBAM"""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv(x)
+        return self.sigmoid(x)
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module"""
+    def __init__(self, channels, reduction=16, kernel_size=7):
+        super().__init__()
+        self.channel_attention = ChannelAttention(channels, reduction)
+        self.spatial_attention = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = x * self.channel_attention(x)
+        x = x * self.spatial_attention(x)
+        return x
+
+
+class MultiStreamCBAM(nn.Module):
+    """CBAM module for multi-stream (RGB-T) processing"""
+    def __init__(self, channels, reduction=16, kernel_size=7, num_streams=2):
+        super().__init__()
+        self.cbam_layers = nn.ModuleList([
+            CBAM(channels, reduction, kernel_size) for _ in range(num_streams)
+        ])
+
+    def forward(self, x):
+        """Apply CBAM to each stream separately"""
+        if isinstance(x, list):
+            assert len(x) == len(self.cbam_layers), 'Number of streams mismatch'
+            return [cbam(stream) for stream, cbam in zip(x, self.cbam_layers)]
+        else:
+            # Single stream
+            return self.cbam_layers[0](x)
+
 class MultiStreamC3TR(nn.Module):
     # Multi-stream C3 module with TransformerBlock for each stream
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, num_streams=2):
@@ -371,26 +437,26 @@ class CrossAttentionFusion(nn.Module):
         return self.conv_out(fused)
 
 class MultiHeadSelfAttention(nn.Module):
-    """Multi-Head Self-Attention module for feature enhancement"""
+    """Multi-Head Self-Attention module for feature enhancement with residual connection."""
     def __init__(self, c1, num_heads=8, dropout=0.1):
         super().__init__()
         self.c1 = c1
         self.num_heads = num_heads
         self.head_dim = c1 // num_heads
-        assert self.head_dim * num_heads == c1, "c1 must be divisible by num_heads"
+        assert self.head_dim * num_heads == c1, f"c1 ({c1}) must be divisible by num_heads ({num_heads})"
         
         self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(c1, c1 * 3)
+        self.qkv = nn.Linear(c1, c1 * 3, bias=False)
         self.proj = nn.Linear(c1, c1)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
         b, c, h, w = x.shape
-        x = x.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, H*W, C)
-        b, n, c = x.shape
+        x_reshaped = x.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, H*W, C)
+        b, n, c = x_reshaped.shape
         
         # Generate Q, K, V
-        qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x_reshaped).reshape(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
         # Attention
@@ -399,13 +465,31 @@ class MultiHeadSelfAttention(nn.Module):
         attn = self.dropout(attn)
         
         # Apply attention to values
-        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
-        x = self.proj(x)
-        x = self.dropout(x)
+        x_out = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        x_out = self.proj(x_out)
+        x_out = self.dropout(x_out)
         
-        # Reshape back to (B, C, H, W)
-        x = x.transpose(1, 2).reshape(b, c, h, w)
-        return x
+        # Reshape back to (B, C, H, W) and add residual connection
+        x_out = x_out.transpose(1, 2).reshape(b, c, h, w)
+        return x + x_out  # Residual connection
+
+
+class MultiStreamSelfAttention(nn.Module):
+    """Wrapper for applying MultiHeadSelfAttention to each stream."""
+    def __init__(self, c1, num_heads=8, dropout=0.1, num_streams=2):
+        super().__init__()
+        self.attn_layers = nn.ModuleList(
+            [MultiHeadSelfAttention(c1, num_heads, dropout) for _ in range(num_streams)]
+        )
+
+    def forward(self, x):
+        """
+        x: list of tensors, one for each stream. e.g., [rgb_features, thermal_features]
+        """
+        if not (isinstance(x, list) and len(x) == len(self.attn_layers)):
+             raise ValueError('Input must be a list of tensors matching the number of streams.')
+        
+        return [layer(tensor) for tensor, layer in zip(x, self.attn_layers)]
 
 
 class CrossModalAttention(nn.Module):
@@ -705,6 +789,37 @@ class Fusion(nn.Module):
         elif self.op == 'sum':
             return torch.sum(x)
 
+class FusionAttention(nn.Module):
+    """Attention-based fusion module for combining RGB and Thermal features"""
+    def __init__(self, c1, c2, num_heads=8):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(c1 * 2, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(c1 * 2)
+        self.conv = Conv(c1 * 2, c2, 1, 1)
+        
+    def forward(self, x):
+        """Fuse RGB and Thermal features using attention"""
+        if isinstance(x, list) and len(x) == 2:
+            rgb, thermal = x
+            b, c, h, w = rgb.shape
+            
+            # Concatenate features
+            fused = torch.cat([rgb, thermal], dim=1)  # (B, 2C, H, W)
+            
+            # Flatten and transpose for attention
+            fused_flat = fused.flatten(2).transpose(1, 2)  # (B, H*W, 2C)
+            
+            # Self-attention on fused features
+            attn_out, _ = self.attention(fused_flat, fused_flat, fused_flat)
+            attn_out = self.norm(attn_out + fused_flat)  # Residual connection
+            
+            # Reshape back
+            attn_out = attn_out.transpose(1, 2).reshape(b, c * 2, h, w)
+            
+            # Final convolution to adjust channels
+            return self.conv(attn_out)
+        else:
+            return x
 
 class DetectMultiBackend(nn.Module):
     # YOLOv5 MultiBackend class for python inference on various backends
