@@ -1123,13 +1123,13 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
                 x1, y1, w, h = self.labels[i][:,1:5].T
                 x2 = x1 + w
                 y2 = y1 + h
-                ignore_idx = (x1 < cond['xRng'][0]) | \
-                            (x2 > cond['xRng'][1]) | \
-                            (y1 < cond['yRng'][0]) | \
-                            (y2 > cond['yRng'][1]) | \
-                            (w < cond['wRng'][0]) | \
-                            (w > cond['wRng'][1]) | \
-                            (h < cond['hRng'][0]) | \
+                ignore_idx = (x1 < cond['xRng'][0]) & \
+                            (x2 > cond['xRng'][1]) & \
+                            (y1 < cond['yRng'][0]) & \
+                            (y2 > cond['yRng'][1]) & \
+                            (w < cond['wRng'][0]) & \
+                            (w > cond['wRng'][1]) & \
+                            (h < cond['hRng'][0]) & \
                             (h > cond['hRng'][1])
                 self.labels[i][ignore_idx, 0] = -1
 
