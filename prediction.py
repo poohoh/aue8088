@@ -388,7 +388,8 @@ def train(hyp, opt, device, callbacks):
         imgsz=imgsz,
         task = "test",
         model=attempt_load(best_model, device).half(),
-        iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
+        # iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
+        iou_thres=0.65 if is_coco else 0.40,  # best pycocotools at iou 0.65
         single_cls=single_cls,
         dataloader=val_loader,
         save_dir=save_dir,

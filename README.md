@@ -130,3 +130,8 @@
     - If you run `train_simple.py` with the default setting, predictions on `test-all-20.txt` will be generated: `runs/train/*/epoch*_predictions.json`
     - You can download this file onto your computer.
     - Note: if size of the prediction file is too large (about > 30MB), evaluation on the server could be failed.
+
+
+command
+- cd /home/junha/workspace/AUE8088 && CUDA_VISIBLE_DEVICES=3 python train_simple.py --data datasets/kaist-rgbt/kfold_splits/yaml_configs/kaist-rgbt-fold1.yaml --cfg models/yolov5s_kaist-rgbt.yaml --weights yolov5s.pt --batch-size 16 --epochs 40 --imgsz 640 --name s_bat16_epo40_auglow_autoanc_labelmap --rgbt --project second --hyp data/hyps/hyp.scratch-low.yaml
+- cd /home/junha/workspace/AUE8088 && CUDA_VISIBLE_DEVICES=3 python train_simple.py --data data/kaist-rgbt.yaml --cfg models/yolov5s_kaist-rgbt.yaml --weights yolov5s.pt --batch-size 32 --epochs 300 --imgsz 640 --name s_bat32_epo300_low_mosaic_autoanchor_clsmap_customloss --rgbt --project train_all --noval

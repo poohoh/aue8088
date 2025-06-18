@@ -62,7 +62,7 @@ from utils.general import (
     yaml_save,
 )
 from utils.loggers import Loggers
-# from utils.loss import ComputeLoss
+from utils.loss import ComputeLoss
 from utils.loss import ComputeCustomLoss
 from utils.metrics import fitness
 from utils.torch_utils import (
@@ -164,7 +164,49 @@ def train(hyp, opt, device, callbacks):
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    
+    # Create parameter groups with different learning rates for attention modules
+    from models.common import (
+        MultiStreamCBAM, DualStreamCrossAttention, CrossModalAttention,
+        MultiHeadSelfAttention, MultiStreamC3Attention, TransformerBlock
+    )
+    attention_types = (MultiStreamCBAM, DualStreamCrossAttention,
+                       CrossModalAttention, MultiHeadSelfAttention,
+                       MultiStreamC3Attention, TransformerBlock)
+
+    attn_ids, bn_ids = set(), set()
+    for m in model.modules():
+        if isinstance(m, attention_types):
+            for p in m.parameters(recurse=True):
+                attn_ids.add(id(p))
+        elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+            for p in m.parameters(recurse=True):
+                bn_ids.add(id(p))
+
+    pg0, pg1, pg2 = [], [], []          # decay O, decay 0, attention low-lr
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        pid = id(p)
+        if pid in bn_ids:
+            pg1.append(p)               # no decay
+        elif pid in attn_ids:
+            pg2.append(p)               # attention
+        else:
+            pg0.append(p)               # default
+
+    optimizer = torch.optim.SGD(
+        [
+            {"params": pg0, "weight_decay": hyp["weight_decay"], "lr": hyp["lr0"]},
+            {"params": pg1, "weight_decay": 0.0,                 "lr": hyp["lr0"]},
+            {"params": pg2, "weight_decay": hyp["weight_decay"], "lr": hyp["lr0"] * 0.1},  # 어텐션 0.1×
+        ],
+        momentum=hyp["momentum"], nesterov=True
+    )
+
+    # warm-up용 initial_lr 지정
+    for g in optimizer.param_groups:
+        g["initial_lr"] = g["lr"]
 
     # Scheduler
     if opt.cos_lr:
@@ -252,8 +294,8 @@ def train(hyp, opt, device, callbacks):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    # compute_loss = ComputeLoss(model)  # init loss class
-    compute_loss = ComputeCustomLoss(model)  # init loss class
+    compute_loss = ComputeLoss(model)  # init loss class
+    # compute_loss = ComputeCustomLoss(model)  # init loss class
     callbacks.run("on_train_start")
     LOGGER.info(
         f'Image sizes {imgsz} train, {imgsz} val\n'

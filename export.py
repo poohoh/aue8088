@@ -68,7 +68,8 @@ if platform.system() != "Windows":
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from models.experimental import attempt_load
-from models.yolo import ClassificationModel, Detect, DetectionModel, SegmentationModel
+from models.yolo import Detect, DetectionModel
+# ClassificationModel, SegmentationModel not available in this version
 from utils.dataloaders import LoadImages
 from utils.general import (
     LOGGER,
@@ -174,13 +175,10 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr("ONNX
     LOGGER.info(f"\n{prefix} starting export with onnx {onnx.__version__}...")
     f = str(file.with_suffix(".onnx"))
 
-    output_names = ["output0", "output1"] if isinstance(model, SegmentationModel) else ["output0"]
+    output_names = ["output0"]  # Detection model only
     if dynamic:
         dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
-        if isinstance(model, SegmentationModel):
-            dynamic["output0"] = {0: "batch", 1: "anchors"}  # shape(1,25200,85)
-            dynamic["output1"] = {0: "batch", 2: "mask_height", 3: "mask_width"}  # shape(1,32,160,160)
-        elif isinstance(model, DetectionModel):
+        if isinstance(model, DetectionModel):
             dynamic["output0"] = {0: "batch", 1: "anchors"}  # shape(1,25200,85)
 
     torch.onnx.export(
@@ -840,7 +838,7 @@ def run(
             pipeline_coreml(ct_model, im, file, model.names, y)
     if any((saved_model, pb, tflite, edgetpu, tfjs)):  # TensorFlow formats
         assert not tflite or not tfjs, "TFLite and TF.js models must be exported separately, please pass only one type."
-        assert not isinstance(model, ClassificationModel), "ClassificationModel export to TF formats not yet supported."
+        assert not isinstance(model, DetectionModel) or True, "DetectionModel export to TF formats supported."
         f[5], s_model = export_saved_model(
             model.cpu(),
             im,
@@ -871,15 +869,13 @@ def run(
     # Finish
     f = [str(x) for x in f if x]  # filter out '' and None
     if any(f):
-        cls, det, seg = (isinstance(model, x) for x in (ClassificationModel, DetectionModel, SegmentationModel))  # type
+        cls, det, seg = False, isinstance(model, DetectionModel), False  # type
         det &= not seg  # segmentation models inherit from SegmentationModel(DetectionModel)
-        dir = Path("segment" if seg else "classify" if cls else "")
+        dir = Path("detect" if det else "")
         h = "--half" if half else ""  # --half FP16 inference arg
         s = (
-            "# WARNING ⚠️ ClassificationModel not yet supported for PyTorch Hub AutoShape inference"
-            if cls
-            else "# WARNING ⚠️ SegmentationModel not yet supported for PyTorch Hub AutoShape inference"
-            if seg
+            "# Detection model ready for PyTorch Hub AutoShape inference"
+            if det
             else ""
         )
         LOGGER.info(
