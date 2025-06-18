@@ -68,6 +68,14 @@ RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 PIN_MEMORY = str(os.getenv("PIN_MEMORY", True)).lower() == "true"  # global pin_memory for dataloaders
 
+# Constants for image transformations
+EXIF_ROTATION_270_90 = [6, 8]  # EXIF rotation values for 270 or 90 degrees
+DEFAULT_EXIF_ORIENTATION = 1
+EXIF_ORIENTATION_TAG = 0x0112
+TORCH_SEED_OFFSET = 6148914691236517205
+FPS_FALLBACK = 30  # Default FPS when stream FPS is invalid
+FPS_LIMIT = 100  # Max FPS percentage limit
+
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
     if ExifTags.TAGS[orientation] == "Orientation":
@@ -75,33 +83,27 @@ for orientation in ExifTags.TAGS.keys():
 
 
 def get_hash(paths):
-    """Generates a single SHA256 hash for a list of file or directory paths by combining their sizes and paths."""
-    size = sum(os.path.getsize(p) for p in paths if os.path.exists(p))  # sizes
-    h = hashlib.sha256(str(size).encode())  # hash sizes
-    h.update("".join(paths).encode())  # hash paths
-    return h.hexdigest()  # return hash
+    """SHA256 hash for file/directory paths."""
+    total_size = sum(os.path.getsize(path) for path in paths if os.path.exists(path))
+    hash_obj = hashlib.sha256(str(total_size).encode())
+    hash_obj.update("".join(paths).encode())
+    return hash_obj.hexdigest()
 
 
 def exif_size(img):
-    """Returns corrected PIL image size (width, height) considering EXIF orientation."""
-    s = img.size  # (width, height)
+    """PIL image size considering EXIF orientation."""
+    size = img.size  # (width, height)
     with contextlib.suppress(Exception):
         rotation = dict(img._getexif().items())[orientation]
-        if rotation in [6, 8]:  # rotation 270 or 90
-            s = (s[1], s[0])
-    return s
+        if rotation in EXIF_ROTATION_270_90:  # rotation 270 or 90
+            size = (size[1], size[0])
+    return size
 
 
 def exif_transpose(image):
-    """
-    Transpose a PIL image accordingly if it has an EXIF Orientation tag.
-    Inplace version of https://github.com/python-pillow/Pillow/blob/master/src/PIL/ImageOps.py exif_transpose()
-
-    :param image: The image to transpose.
-    :return: An image.
-    """
+    """Transpose PIL image based on EXIF orientation."""
     exif = image.getexif()
-    orientation = exif.get(0x0112, 1)  # default 1
+    orientation = exif.get(EXIF_ORIENTATION_TAG, DEFAULT_EXIF_ORIENTATION)  # default 1
     if orientation > 1:
         method = {
             2: Image.FLIP_LEFT_RIGHT,
@@ -114,47 +116,43 @@ def exif_transpose(image):
         }.get(orientation)
         if method is not None:
             image = image.transpose(method)
-            del exif[0x0112]
+            del exif[EXIF_ORIENTATION_TAG]
             image.info["exif"] = exif.tobytes()
     return image
 
 
 def seed_worker(worker_id):
-    """
-    Sets the seed for a dataloader worker to ensure reproducibility, based on PyTorch's randomness notes.
-
-    See https://pytorch.org/docs/stable/notes/randomness.html#dataloader.
-    """
+    """Set seed for dataloader worker reproducibility."""
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
 
-# Inherit from DistributedSampler and override iterator
+# Inherit from DistributedSampler
 # https://github.com/pytorch/pytorch/blob/master/torch/utils/data/distributed.py
 class SmartDistributedSampler(distributed.DistributedSampler):
     def __iter__(self):
-        """Yields indices for distributed data sampling, shuffled deterministically based on epoch and seed."""
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
+        """Distributed data sampling indices."""
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
 
-        # determine the eventual size (n) of self.indices (DDP indices)
-        n = int((len(self.dataset) - self.rank - 1) / self.num_replicas) + 1  # num_replicas == WORLD_SIZE
-        idx = torch.randperm(n, generator=g)
+        # DDP indices size
+        dataset_size = int((len(self.dataset) - self.rank - 1) / self.num_replicas) + 1  # num_replicas == WORLD_SIZE
+        indices = torch.randperm(dataset_size, generator=generator)
         if not self.shuffle:
-            idx = idx.sort()[0]
+            indices = indices.sort()[0]
 
-        idx = idx.tolist()
+        indices = indices.tolist()
         if self.drop_last:
-            idx = idx[: self.num_samples]
+            indices = indices[: self.num_samples]
         else:
-            padding_size = self.num_samples - len(idx)
-            if padding_size <= len(idx):
-                idx += idx[:padding_size]
+            padding_size = self.num_samples - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
             else:
-                idx += (idx * math.ceil(padding_size / len(idx)))[:padding_size]
+                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
 
-        return iter(idx)
+        return iter(indices)
 
 
 def create_dataloader(
@@ -200,17 +198,17 @@ def create_dataloader(
         )
 
     batch_size = min(batch_size, len(dataset))
-    nd = torch.cuda.device_count()  # number of CUDA devices
-    nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
+    num_devices = torch.cuda.device_count()  # number of CUDA devices
+    num_workers = min([os.cpu_count() // max(num_devices, 1), batch_size if batch_size > 1 else 0, workers])
     sampler = None if rank == -1 else SmartDistributedSampler(dataset, shuffle=shuffle)
-    loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
+    loader_class = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
     generator = torch.Generator()
-    generator.manual_seed(6148914691236517205 + seed + RANK)
-    return loader(
+    generator.manual_seed(TORCH_SEED_OFFSET + seed + RANK)
+    return loader_class(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle and sampler is None,
-        num_workers=nw,
+        num_workers=num_workers,
         sampler=sampler,
         pin_memory=PIN_MEMORY,
         collate_fn=dataset_class.collate_fn4 if quad else dataset_class.collate_fn,
@@ -227,19 +225,17 @@ class InfiniteDataLoader(dataloader.DataLoader):
     """
 
     def __init__(self, *args, **kwargs):
-        """Initializes an InfiniteDataLoader that reuses workers with standard DataLoader syntax, augmenting with a
-        repeating sampler.
-        """
+        """Initializes InfiniteDataLoader with repeating sampler."""
         super().__init__(*args, **kwargs)
         object.__setattr__(self, "batch_sampler", _RepeatSampler(self.batch_sampler))
         self.iterator = super().__iter__()
 
     def __len__(self):
-        """Returns the length of the batch sampler's sampler in the InfiniteDataLoader."""
+        """Batch sampler length."""
         return len(self.batch_sampler.sampler)
 
     def __iter__(self):
-        """Yields batches of data indefinitely in a loop by resetting the sampler when exhausted."""
+        """Infinite data iteration loop."""
         for _ in range(len(self)):
             yield next(self.iterator)
 
@@ -253,21 +249,20 @@ class _RepeatSampler:
     """
 
     def __init__(self, sampler):
-        """Initializes a perpetual sampler wrapping a provided `Sampler` instance for endless data iteration."""
+        """Initialize perpetual sampler."""
         self.sampler = sampler
 
     def __iter__(self):
-        """Returns an infinite iterator over the dataset by repeatedly yielding from the given sampler."""
+        """Infinite iterator over dataset."""
         while True:
             yield from iter(self.sampler)
 
 
 class LoadScreenshots:
-    # YOLOv5 screenshot dataloader, i.e. `python detect.py --source "screen 0 100 100 512 256"`
+    # YOLOv5 screenshot dataloader
     def __init__(self, source, img_size=640, stride=32, auto=True, transforms=None):
         """
-        Initializes a screenshot dataloader for YOLOv5 with specified source region, image size, stride, auto, and
-        transforms.
+        Initialize screenshot dataloader.
 
         Source = [screen_number left top width height] (pixels)
         """
@@ -299,7 +294,7 @@ class LoadScreenshots:
         self.monitor = {"left": self.left, "top": self.top, "width": self.width, "height": self.height}
 
     def __iter__(self):
-        """Iterates over itself, enabling use in loops and iterable contexts."""
+        """Iterator enabler."""
         return self
 
     def __next__(self):
@@ -323,7 +318,7 @@ class LoadImages:
     """YOLOv5 image/video dataloader, i.e. `python detect.py --source image.jpg/vid.mp4`"""
 
     def __init__(self, path, img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
-        """Initializes YOLOv5 loader for images/videos, supporting glob patterns, directories, and lists of paths."""
+        """Initialize YOLOv5 loader for images/videos."""
         if isinstance(path, str) and Path(path).suffix == ".txt":  # *.txt file with img/vid/dir on each line
             path = Path(path).read_text().rsplit()
         files = []
@@ -340,13 +335,13 @@ class LoadImages:
 
         images = [x for x in files if x.split(".")[-1].lower() in IMG_FORMATS]
         videos = [x for x in files if x.split(".")[-1].lower() in VID_FORMATS]
-        ni, nv = len(images), len(videos)
+        num_images, num_videos = len(images), len(videos)
 
         self.img_size = img_size
         self.stride = stride
         self.files = images + videos
-        self.nf = ni + nv  # number of files
-        self.video_flag = [False] * ni + [True] * nv
+        self.num_files = num_images + num_videos  # number of files
+        self.video_flag = [False] * num_images + [True] * num_videos
         self.mode = "image"
         self.auto = auto
         self.transforms = transforms  # optional
@@ -355,19 +350,19 @@ class LoadImages:
             self._new_video(videos[0])  # new video
         else:
             self.cap = None
-        assert self.nf > 0, (
+        assert self.num_files > 0, (
             f"No images or videos found in {p}. "
             f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
         )
 
     def __iter__(self):
-        """Initializes iterator by resetting count and returns the iterator object itself."""
+        """Initialize iterator."""
         self.count = 0
         return self
 
     def __next__(self):
-        """Advances to the next file in the dataset, raising StopIteration if at the end."""
-        if self.count == self.nf:
+        """Advance to next file."""
+        if self.count == self.num_files:
             raise StopIteration
         path = self.files[self.count]
 
@@ -376,35 +371,35 @@ class LoadImages:
             self.mode = "video"
             for _ in range(self.vid_stride):
                 self.cap.grab()
-            ret_val, im0 = self.cap.retrieve()
+            ret_val, img_original = self.cap.retrieve()
             while not ret_val:
                 self.count += 1
                 self.cap.release()
-                if self.count == self.nf:  # last video
+                if self.count == self.num_files:  # last video
                     raise StopIteration
                 path = self.files[self.count]
                 self._new_video(path)
-                ret_val, im0 = self.cap.read()
+                ret_val, img_original = self.cap.read()
 
             self.frame += 1
-            # im0 = self._cv2_rotate(im0)  # for use if cv2 autorotation is False
-            s = f"video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: "
+            # img_original = self._cv2_rotate(img_original)  # for use if cv2 autorotation is False
+            status_msg = f"video {self.count + 1}/{self.num_files} ({self.frame}/{self.frames}) {path}: "
 
         else:
             # Read image
             self.count += 1
-            im0 = cv2.imread(path)  # BGR
-            assert im0 is not None, f"Image Not Found {path}"
-            s = f"image {self.count}/{self.nf} {path}: "
+            img_original = cv2.imread(path)  # BGR
+            assert img_original is not None, f"Image Not Found {path}"
+            status_msg = f"image {self.count}/{self.num_files} {path}: "
 
         if self.transforms:
-            im = self.transforms(im0)  # transforms
+            img = self.transforms(img_original)  # transforms
         else:
-            im = letterbox(im0, self.img_size, stride=self.stride, auto=self.auto)[0]  # padded resize
-            im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-            im = np.ascontiguousarray(im)  # contiguous
+            img = letterbox(img_original, self.img_size, stride=self.stride, auto=self.auto)[0]  # padded resize
+            img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+            img = np.ascontiguousarray(img)  # contiguous
 
-        return path, im, im0, self.cap, s
+        return path, img, img_original, self.cap, status_msg
 
     def _new_video(self, path):
         """Initializes a new video capture object with path, frame count adjusted by stride, and orientation
@@ -417,7 +412,7 @@ class LoadImages:
         # self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)  # disable https://github.com/ultralytics/yolov5/issues/8493
 
     def _cv2_rotate(self, im):
-        """Rotates a cv2 image based on its orientation; supports 0, 90, and 180 degrees rotations."""
+        """Rotate cv2 image based on orientation."""
         if self.orientation == 0:
             return cv2.rotate(im, cv2.ROTATE_90_CLOCKWISE)
         elif self.orientation == 180:
@@ -427,12 +422,12 @@ class LoadImages:
         return im
 
     def __len__(self):
-        """Returns the number of files in the dataset."""
-        return self.nf  # number of files
+        """Number of files in dataset."""
+        return self.num_files  # number of files
 
 
 class LoadStreams:
-    # YOLOv5 streamloader, i.e. `python detect.py --source 'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP streams`
+    # YOLOv5 streamloader
     def __init__(self, sources="file.streams", img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
         """Initializes a stream loader for processing video streams with YOLOv5, supporting various sources including
         YouTube.
@@ -443,62 +438,62 @@ class LoadStreams:
         self.stride = stride
         self.vid_stride = vid_stride  # video frame-rate stride
         sources = Path(sources).read_text().rsplit() if os.path.isfile(sources) else [sources]
-        n = len(sources)
+        num_sources = len(sources)
         self.sources = [clean_str(x) for x in sources]  # clean source names for later
-        self.imgs, self.fps, self.frames, self.threads = [None] * n, [0] * n, [0] * n, [None] * n
-        for i, s in enumerate(sources):  # index, source
+        self.imgs, self.fps, self.frames, self.threads = [None] * num_sources, [0] * num_sources, [0] * num_sources, [None] * num_sources
+        for source_idx, source in enumerate(sources):  # index, source
             # Start thread to read frames from video stream
-            st = f"{i + 1}/{n}: {s}... "
-            if urlparse(s).hostname in ("www.youtube.com", "youtube.com", "youtu.be"):  # if source is YouTube video
-                # YouTube format i.e. 'https://www.youtube.com/watch?v=Zgi9g1ksQHc' or 'https://youtu.be/LNwODJXcvt4'
+            status_msg = f"{source_idx + 1}/{num_sources}: {source}... "
+            if urlparse(source).hostname in ("www.youtube.com", "youtube.com", "youtu.be"):  # if source is YouTube video
+                # YouTube format
                 check_requirements(("pafy", "youtube_dl==2020.12.2"))
                 import pafy
 
-                s = pafy.new(s).getbest(preftype="mp4").url  # YouTube URL
-            s = eval(s) if s.isnumeric() else s  # i.e. s = '0' local webcam
-            if s == 0:
+                source = pafy.new(source).getbest(preftype="mp4").url  # YouTube URL
+            source = eval(source) if source.isnumeric() else source  # i.e. source = '0' local webcam
+            if source == 0:
                 assert not is_colab(), "--source 0 webcam unsupported on Colab. Rerun command in a local environment."
                 assert not is_kaggle(), "--source 0 webcam unsupported on Kaggle. Rerun command in a local environment."
-            cap = cv2.VideoCapture(s)
-            assert cap.isOpened(), f"{st}Failed to open {s}"
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap = cv2.VideoCapture(source)
+            assert cap.isOpened(), f"{status_msg}Failed to open {source}"
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = cap.get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
-            self.frames[i] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float("inf")  # infinite stream fallback
-            self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
+            self.frames[source_idx] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float("inf")  # infinite stream fallback
+            self.fps[source_idx] = max((fps if math.isfinite(fps) else 0) % FPS_LIMIT, 0) or FPS_FALLBACK  # 30 FPS fallback
 
-            _, self.imgs[i] = cap.read()  # guarantee first frame
-            self.threads[i] = Thread(target=self.update, args=([i, cap, s]), daemon=True)
-            LOGGER.info(f"{st} Success ({self.frames[i]} frames {w}x{h} at {self.fps[i]:.2f} FPS)")
-            self.threads[i].start()
+            _, self.imgs[source_idx] = cap.read()  # guarantee first frame
+            self.threads[source_idx] = Thread(target=self.update, args=([source_idx, cap, source]), daemon=True)
+            LOGGER.info(f"{status_msg} Success ({self.frames[source_idx]} frames {width}x{height} at {self.fps[source_idx]:.2f} FPS)")
+            self.threads[source_idx].start()
         LOGGER.info("")  # newline
 
         # check for common shapes
-        s = np.stack([letterbox(x, img_size, stride=stride, auto=auto)[0].shape for x in self.imgs])
-        self.rect = np.unique(s, axis=0).shape[0] == 1  # rect inference if all shapes equal
+        shapes = np.stack([letterbox(x, img_size, stride=stride, auto=auto)[0].shape for x in self.imgs])
+        self.rect = np.unique(shapes, axis=0).shape[0] == 1  # rect inference if all shapes equal
         self.auto = auto and self.rect
         self.transforms = transforms  # optional
         if not self.rect:
             LOGGER.warning("WARNING ⚠️ Stream shapes differ. For optimal performance supply similarly-shaped streams.")
 
-    def update(self, i, cap, stream):
-        """Reads frames from stream `i`, updating imgs array; handles stream reopening on signal loss."""
-        n, f = 0, self.frames[i]  # frame number, frame array
-        while cap.isOpened() and n < f:
-            n += 1
+    def update(self, stream_idx, cap, stream):
+        """Read frames from stream, handle reconnection."""
+        frame_num, max_frames = 0, self.frames[stream_idx]  # frame number, frame array
+        while cap.isOpened() and frame_num < max_frames:
+            frame_num += 1
             cap.grab()  # .read() = .grab() followed by .retrieve()
-            if n % self.vid_stride == 0:
-                success, im = cap.retrieve()
+            if frame_num % self.vid_stride == 0:
+                success, img = cap.retrieve()
                 if success:
-                    self.imgs[i] = im
+                    self.imgs[stream_idx] = img
                 else:
                     LOGGER.warning("WARNING ⚠️ Video stream unresponsive, please check your IP camera connection.")
-                    self.imgs[i] = np.zeros_like(self.imgs[i])
+                    self.imgs[stream_idx] = np.zeros_like(self.imgs[stream_idx])
                     cap.open(stream)  # re-open stream if signal was lost
             time.sleep(0.0)  # wait time
 
     def __iter__(self):
-        """Resets and returns the iterator for iterating over video frames or images in a dataset."""
+        """Reset iterator."""
         self.count = -1
         return self
 
@@ -522,7 +517,7 @@ class LoadStreams:
         return self.sources, im, im0, None, ""
 
     def __len__(self):
-        """Returns the number of sources in the dataset, supporting up to 32 streams at 30 FPS over 30 years."""
+        """Number of sources in dataset."""
         return len(self.sources)  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
 
@@ -530,12 +525,12 @@ def img2label_paths(img_paths):
     """Generates label file paths from corresponding image file paths by replacing `/images/` with `/labels/` and
     extension with `.txt`.
     """
-    sa, sb = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"  # /images/, /labels/ substrings
-    return [sb.join(x.rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt" for x in img_paths]
+    images_sep, labels_sep = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"  # /images/, /labels/ substrings
+    return [labels_sep.join(path.rsplit(images_sep, 1)).rsplit(".", 1)[0] + ".txt" for path in img_paths]
 
 
 class LoadImagesAndLabels(Dataset):
-    # YOLOv5 train_loader/val_loader, loads images and labels for training and validation
+    # YOLOv5 train/val loader
     cache_version = 0.6  # dataset labels *.cache version
     rand_interp_methods = [cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4]
 
@@ -562,7 +557,7 @@ class LoadImagesAndLabels(Dataset):
         self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time (training only)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
@@ -641,7 +636,7 @@ class LoadImagesAndLabels(Dataset):
         self.n = n
         self.indices = np.arange(n)
         if rank > -1:  # DDP indices (see: SmartDistributedSampler)
-            # force each rank (i.e. GPU process) to sample the same subset of data on every epoch
+            # Force same subset sampling per GPU
             self.indices = self.indices[np.random.RandomState(seed=seed).permutation(n) % WORLD_SIZE == RANK]
 
         # Update labels
@@ -706,7 +701,7 @@ class LoadImagesAndLabels(Dataset):
             pbar.close()
 
     def check_cache_ram(self, safety_margin=0.1, prefix=""):
-        """Checks if available RAM is sufficient for caching images, adjusting for a safety margin."""
+        """Check RAM sufficiency for caching."""
         b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
         n = min(self.n, 30)  # extrapolate from 30 random images
         for _ in range(n):
@@ -725,7 +720,7 @@ class LoadImagesAndLabels(Dataset):
         return cache
 
     def cache_labels(self, path=Path("./labels.cache"), prefix=""):
-        """Caches dataset labels, verifies images, reads shapes, and tracks dataset integrity."""
+        """Cache labels and verify images."""
         x = {}  # dict
         data = []  # use list to keep image orders
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
@@ -767,7 +762,7 @@ class LoadImagesAndLabels(Dataset):
         return x
 
     def __len__(self):
-        """Returns the number of images in the dataset."""
+        """Number of images in dataset."""
         return len(self.im_files)
 
     # def __iter__(self):
@@ -1141,7 +1136,7 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         return [sb.join(x.rsplit(sa, 1)).rsplit(".", 1)[0] + ".txt" for x in img_paths]
 
     def cache_labels(self, path=Path("./labels.cache"), prefix=""):
-        """Caches dataset labels, verifies images, reads shapes, and tracks dataset integrity."""
+        """Cache labels and verify images."""
         x = {}  # dict
         data = []  # use list to keep image orders
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
@@ -1233,7 +1228,7 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
             # Process both thermal and visible images
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             
-            # Apply letterbox to both images with same parameters
+            # Apply letterbox with same parameters
             img_lwir, ratio, pad = letterbox(imgs[0], shape, auto=False, scaleup=self.augment)
             img_vis, _, _ = letterbox(imgs[1], shape, auto=False, scaleup=self.augment)
             imgs = [img_lwir, img_vis]
@@ -1262,13 +1257,13 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=imgs[0].shape[1], h=imgs[0].shape[0], clip=True, eps=1e-3)
 
         if self.augment:
-            # Albumentations (apply same transform to both images)
+            # Albumentations (same transform for both)
             if self.albumentations:
                 imgs[0], labels = self.albumentations(imgs[0], labels)
                 imgs[1], _ = self.albumentations(imgs[1], labels)
                 nl = len(labels)  # update after albumentations
 
-            # HSV color-space augmentation (only for visible image)
+            # HSV augmentation (visible image only)
             augment_hsv(imgs[1], hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
 
             # Flip up-down (both images)
@@ -1301,64 +1296,64 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
     def load_mosaic_rgbt(self, index):
         """Loads a 4-image mosaic for RGB-T pairs."""
-        labels4, segments4 = [], []
-        s = self.img_size
-        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
-        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
-        random.shuffle(indices)
+        labels_4img, segments_4img = [], []
+        img_size = self.img_size
+        center_y, center_x = (int(random.uniform(-x, 2 * img_size + x)) for x in self.mosaic_border)  # mosaic center x, y
+        selected_indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+        random.shuffle(selected_indices)
         
         # Initialize mosaic images for both modalities
-        img4_lwir = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
-        img4_vis = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
+        mosaic_lwir = np.full((img_size * 2, img_size * 2, 3), 114, dtype=np.uint8)
+        mosaic_vis = np.full((img_size * 2, img_size * 2, 3), 114, dtype=np.uint8)
         
-        for i, idx in enumerate(indices):
+        for tile_idx, img_idx in enumerate(selected_indices):
             # Load RGB-T image pair
-            imgs, _, _ = self.load_image(idx)
+            imgs, _, _ = self.load_image(img_idx)
             img_lwir, img_vis = imgs[0], imgs[1]
-            # 로드된 이미지의 shape에서 직접 높이(h)와 너비(w)를 가져옵니다.
-            h, w = img_lwir.shape[:2]
+            # Get height and width from image shape
+            height, width = img_lwir.shape[:2]
 
-            # Place img in img4
-            if i == 0:  # top left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
-            elif i == 1:  # top right
-                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
-                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
-            elif i == 2:  # bottom left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
-            elif i == 3:  # bottom right
-                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+            # Place img in mosaic
+            if tile_idx == 0:  # top left
+                x1a, y1a, x2a, y2a = max(center_x - width, 0), max(center_y - height, 0), center_x, center_y  # large image coords
+                x1b, y1b, x2b, y2b = width - (x2a - x1a), height - (y2a - y1a), width, height  # small image coords
+            elif tile_idx == 1:  # top right
+                x1a, y1a, x2a, y2a = center_x, max(center_y - height, 0), min(center_x + width, img_size * 2), center_y
+                x1b, y1b, x2b, y2b = 0, height - (y2a - y1a), min(width, x2a - x1a), height
+            elif tile_idx == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(center_x - width, 0), center_y, center_x, min(img_size * 2, center_y + height)
+                x1b, y1b, x2b, y2b = width - (x2a - x1a), 0, width, min(y2a - y1a, height)
+            elif tile_idx == 3:  # bottom right
+                x1a, y1a, x2a, y2a = center_x, center_y, min(center_x + width, img_size * 2), min(img_size * 2, center_y + height)
+                x1b, y1b, x2b, y2b = 0, 0, min(width, x2a - x1a), min(y2a - y1a, height)
 
             # Apply to both images
-            img4_lwir[y1a:y2a, x1a:x2a] = img_lwir[y1b:y2b, x1b:x2b]
-            img4_vis[y1a:y2a, x1a:x2a] = img_vis[y1b:y2b, x1b:x2b]
+            mosaic_lwir[y1a:y2a, x1a:x2a] = img_lwir[y1b:y2b, x1b:x2b]
+            mosaic_vis[y1a:y2a, x1a:x2a] = img_vis[y1b:y2b, x1b:x2b]
             
-            padw = x1a - x1b
-            padh = y1a - y1b
+            pad_width = x1a - x1b
+            pad_height = y1a - y1b
 
             # Labels
-            labels, segments = self.labels[idx].copy(), self.segments[idx].copy()
+            labels, segments = self.labels[img_idx].copy(), self.segments[img_idx].copy()
             if labels.size:
                 labels[:, 1:3] += labels[:, 3:5] / 2.0  # convert to center format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
-                segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
-            labels4.append(labels)
-            segments4.extend(segments)
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], width, height, pad_width, pad_height)  # normalized xywh to pixel xyxy format
+                segments = [xyn2xy(segment, width, height, pad_width, pad_height) for segment in segments]
+            labels_4img.append(labels)
+            segments_4img.extend(segments)
 
         # Concat/clip labels
-        labels4 = np.concatenate(labels4, 0)
-        for x in (labels4[:, 1:], *segments4):
-            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+        labels_4img = np.concatenate(labels_4img, 0)
+        for coords in (labels_4img[:, 1:], *segments_4img):
+            np.clip(coords, 0, 2 * img_size, out=coords)  # clip when using random_perspective()
 
         # Augment
-        imgs = [img4_lwir, img4_vis]
-        imgs, labels4 = random_perspective_rgbt(
-            imgs,
-            labels4,
-            segments4,
+        mosaic_imgs = [mosaic_lwir, mosaic_vis]
+        mosaic_imgs, labels_4img = random_perspective_rgbt(
+            mosaic_imgs,
+            labels_4img,
+            segments_4img,
             degrees=self.hyp["degrees"],
             translate=self.hyp["translate"],
             scale=self.hyp["scale"],
@@ -1367,7 +1362,7 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
             border=self.mosaic_border,
         )
 
-        return imgs, labels4
+        return mosaic_imgs, labels_4img
 
     def load_image(self, i):
         """
